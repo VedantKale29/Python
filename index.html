@@ -743,7 +743,7 @@ P.prototype.simple = function(){
         return { k:'ImportFrom', module:mod, names:names, line:x.line }; }
       case 'global': case 'nonlocal': { this.next(); var g = [];
         do { g.push(this.expect('NAME').v); } while(this.eat('OP',','));
-        return { k:'Scope0', names:g }; }
+        return { k:'Scope0', kind:x.v, names:g }; }
       case 'assert': { this.next(); var t1 = this.expr();
         return { k:'Assert', test:t1, msg: this.eat('OP',',') ? this.expr() : null, line:x.line }; }
       case 'del': { this.next(); var tg = [this.expr()];
@@ -764,9 +764,12 @@ P.prototype.simple = function(){
     return { k:'AugAssign', target:first, op:aug[i].slice(0,-1), value:this.exprList(), line:x.line };
   }
   if(this.atOp(':')){
-    this.next(); this.expr();
-    if(this.eat('OP','=')) return { k:'Assign', targets:[first], value:this.exprList(), line:x.line };
-    return { k:'Pass' };
+    this.next();
+    var ann = this.expr();
+    var nm = first.k === 'Name' ? first.v : null;
+    if(this.eat('OP','='))
+      return { k:'Assign', targets:[first], value:this.exprList(), ann:nm, line:x.line };
+    return { k:'AnnDecl', name:nm, line:x.line };
   }
   return { k:'Expr', value:first, line:x.line };
 };
@@ -1048,29 +1051,42 @@ P.prototype.atom = function(){
   if(this.atOp('(')){
     this.next();
     if(this.atOp(')')){ this.next(); return { k:'Tuple', items:[] }; }
-    var e = this.expr();
+    var e = this.atOp('*') ? (this.next(), { k:'Spread', value:this.expr() }) : this.expr();
     if(this.atKw('for')){ var g = this.comprehension(e, 'gen'); this.expect('OP',')'); return g; }
     if(this.atOp(',')){
       var items = [e];
-      while(this.eat('OP',',')){ if(this.atOp(')')) break; items.push(this.expr()); }
+      while(this.eat('OP',',')){ if(this.atOp(')')) break;
+        items.push(this.atOp('*') ? (this.next(), { k:'Spread', value:this.expr() }) : this.expr()); }
       this.expect('OP',')');
       return { k:'Tuple', items:items };
     }
+    if(e.k === 'Spread'){ this.expect('OP',')'); return { k:'Tuple', items:[e] }; }
     this.expect('OP',')'); return e;
   }
   if(this.atOp('[')){
     this.next();
     if(this.atOp(']')){ this.next(); return { k:'List', items:[] }; }
-    var e2 = this.expr();
+    var e2 = this.atOp('*') ? (this.next(), { k:'Spread', value:this.expr() }) : this.expr();
     if(this.atKw('for')){ var g2 = this.comprehension(e2, 'list'); this.expect('OP',']'); return g2; }
     var i2 = [e2];
-    while(this.eat('OP',',')){ if(this.atOp(']')) break; i2.push(this.expr()); }
+    while(this.eat('OP',',')){ if(this.atOp(']')) break;
+      i2.push(this.atOp('*') ? (this.next(), { k:'Spread', value:this.expr() }) : this.expr()); }
     this.expect('OP',']');
     return { k:'List', items:i2 };
   }
   if(this.atOp('{')){
     this.next();
     if(this.atOp('}')){ this.next(); return { k:'Dict', keys:[], values:[] }; }
+    if(this.atOp('**')){                       /* {**a, 'k': v} */
+      var dkeys = [], dvals = [];
+      do {
+        if(this.atOp('}')) break;
+        if(this.eat('OP','**')){ dkeys.push(null); dvals.push(this.expr()); }
+        else { dkeys.push(this.expr()); this.expect('OP',':'); dvals.push(this.expr()); }
+      } while(this.eat('OP',','));
+      this.expect('OP','}');
+      return { k:'Dict', keys:dkeys, values:dvals };
+    }
     var k1 = this.expr();
     if(this.eat('OP',':')){
       var v1 = this.expr();
@@ -1078,6 +1094,7 @@ P.prototype.atom = function(){
       var keys = [k1], vals = [v1];
       while(this.eat('OP',',')){
         if(this.atOp('}')) break;
+        if(this.eat('OP','**')){ keys.push(null); vals.push(this.expr()); continue; }
         keys.push(this.expr()); this.expect('OP',':'); vals.push(this.expr());
       }
       this.expect('OP','}');
@@ -1174,6 +1191,10 @@ function PyBound(self, fn){ this.self=self; this.fn=fn; }
 function PyNative(name, fn){ this.name=name; this.fn=fn; }
 function PyModule(name, dict){ this.name=name; this.dict=dict; }
 function PyGen(iter, name){ this.iter=iter; this.name=name; }
+function PyStatic(fn){ this.fn = fn; }
+function PyClassM(fn){ this.fn = fn; }
+function PyProp(fget, fset){ this.fget = fget; this.fset = fset; }
+function PySuper(cls, self){ this.cls = cls; this.self = self; }
 function PyRange(a,b,c){ this.start=a; this.stop=b; this.step=c; }
 function PyErr(type, msg){ this.type=type; this.msg=msg; this.__py=true; }
 /* JS has a single number type, so an integral float like 4.0 is
@@ -1183,6 +1204,8 @@ function ub(v){ return v instanceof PyFloat ? v.v : v; }
 function mkf(x){ return Number.isInteger(x) ? new PyFloat(x) : x; }
 function raise(t,m){ throw new PyErr(t,m); }
 var IDN = 0;
+function lookup(){ return root.__PYE.lookup.apply(null, arguments); }
+function call(){ return root.__PYE.call.apply(null, arguments); }
 function kof(v){
   v = ub(v);
   if(v === null || v === undefined) return 'N';
@@ -1333,6 +1356,10 @@ function cmpv(a,b){
 }
 function has(hay, x){
   hay=ub(hay); x=ub(x);
+  if(hay instanceof PyObj){
+    var c = lookup(hay, '__contains__');
+    if(c) return truthy(call(c, [x], null));
+  }
   if(typeof hay==='string') return hay.indexOf(str(x))>=0;
   if(hay instanceof PyDict) return hay.has(x);
   if(hay instanceof PySet) return hay.has(x);
@@ -1343,13 +1370,11 @@ function has(hay, x){
   }
   return arr(hay).some(function(y){ return eq(y,x); });
 }
-root.__PYR = { PyFloat:PyFloat, ub:ub, mkf:mkf, PyDict:PyDict, PySet:PySet, PyTuple:PyTuple, PyFunc:PyFunc, PyClass:PyClass,
+root.__PYR = { PyStatic:PyStatic, PyClassM:PyClassM, PyProp:PyProp, PySuper:PySuper, PyFloat:PyFloat, ub:ub, mkf:mkf, PyDict:PyDict, PySet:PySet, PyTuple:PyTuple, PyFunc:PyFunc, PyClass:PyClass,
   PyObj:PyObj, PyBound:PyBound, PyNative:PyNative, PyModule:PyModule, PyGen:PyGen,
   PyRange:PyRange, PyErr:PyErr, raise:raise, kof:kof, truthy:truthy, tname:tname, repr:repr,
   str:str, iter:iter, arr:arr, plen:plen, eq:eq, cmpv:cmpv, has:has, isInt:isInt, fnum:fnum,
   rlen:rlen, parse:parse };
-function lookup(){ return root.__PYE.lookup.apply(null, arguments); }
-function call(){ return root.__PYE.call.apply(null, arguments); }
 })(typeof window !== 'undefined' ? window : (typeof globalThis !== 'undefined' ? globalThis : this));
 
 /* ============================================================
@@ -1417,10 +1442,24 @@ function clsLookup(c, name){
 }
 function lookup(o, name){
   if(o instanceof PyObj){
+    /* a property on the class wins over the instance dict, as in Python */
+    var pm = clsLookup(o.cls, name);
+    if(pm instanceof R.PyProp) return call(pm.fget, [o], null);
     if(o.fields.has(name)) return o.fields.get(name);
-    var m = clsLookup(o.cls, name);
-    if(m===undefined) return undefined;
-    return (m instanceof PyFunc || m instanceof PyNative) ? new PyBound(o, m) : m;
+    if(pm===undefined) return undefined;
+    if(pm instanceof R.PyStatic) return pm.fn;
+    if(pm instanceof R.PyClassM) return new PyBound(o.cls, pm.fn);
+    return (pm instanceof PyFunc || pm instanceof PyNative) ? new PyBound(o, pm) : pm;
+  }
+  if(o instanceof R.PySuper){
+    /* skip past the defining class and search its bases */
+    var found;
+    for(var i=0;i<o.cls.bases.length && found===undefined;i++) found = clsLookup(o.cls.bases[i], name);
+    if(found===undefined) return undefined;
+    if(found instanceof R.PyStatic) return found.fn;
+    if(found instanceof R.PyClassM) return new PyBound(o.self.cls, found.fn);
+    if(found instanceof R.PyProp) return call(found.fget, [o.self], null);
+    return (found instanceof PyFunc || found instanceof PyNative) ? new PyBound(o.self, found) : found;
   }
   return undefined;
 }
@@ -1435,7 +1474,14 @@ function getattr(o, name){
   if(name === '__dict__' && o instanceof PyObj){
     var d = new R.PyDict(); o.fields.forEach(function(val,k){ d.set(k,val); }); return d;
   }
-  if(o instanceof PyClass){ var c=clsLookup(o,name); if(c!==undefined) return c; }
+  if(o instanceof PyClass){
+    var c=clsLookup(o,name);
+    if(c!==undefined){
+      if(c instanceof R.PyStatic) return c.fn;
+      if(c instanceof R.PyClassM) return new PyBound(o, c.fn);
+      return c;
+    }
+  }
   if(o instanceof PyModule){
     if(o.dict.has(name)) return o.dict.get(name);
     raise('AttributeError',"module '"+o.name+"' has no attribute '"+name+"'");
@@ -1449,7 +1495,14 @@ function getattr(o, name){
   raise('AttributeError',"'"+tname(o)+"' object has no attribute '"+name+"'");
 }
 function setattr(o,n,v){
-  if(o instanceof PyObj){ o.fields.set(n,v); return; }
+  if(o instanceof PyObj){
+    var pm = clsLookup(o.cls, n);
+    if(pm instanceof R.PyProp){
+      if(!pm.fset) raise('AttributeError', "can't set attribute '"+n+"'");
+      call(pm.fset, [o, v], null); return;
+    }
+    o.fields.set(n,v); return;
+  }
   if(o instanceof PyClass){ o.dict.set(n,v); return; }
   if(o instanceof PyModule){ o.dict.set(n,v); return; }
   raise('AttributeError',"'"+tname(o)+"' object has no attribute '"+n+"'");
@@ -1460,6 +1513,7 @@ function call(f, args, kw){
   if(f instanceof PyBound) return call(f.fn, [f.self].concat(args), kw);
   if(f instanceof PyFunc){
     var sc = new Scope(f.closure);
+    if(f.__cls){ sc.v.set('__class__', f.__cls); if(args.length && args[0] instanceof PyObj) sc.v.set('__self__', args[0]); }
     bind(f, args, kw, sc);
     if(f.isGen) return new PyGen(execBlockIter(f.body, sc), f.name);
     var it = execBlock(f.body, sc), r;
@@ -1576,11 +1630,20 @@ function* execStmt(s, sc){
   switch(s.k){
     case 'Expr': yield* evalG(s.value, sc); return;
     case 'Assign': { var v = yield* evalG(s.value, sc);
+      if(s.ann){ sc.__anns = sc.__anns || []; if(sc.__anns.indexOf(s.ann) < 0) sc.__anns.push(s.ann); }
       for(var t=0;t<s.targets.length;t++) assign(s.targets[t], v, sc); return; }
     case 'AugAssign': { var cur = evalE(s.target, sc), rhs = yield* evalG(s.value, sc);
       assign(s.target, binop(s.op, cur, rhs), sc); return; }
     case 'Suite': return yield* execBlock(s.body, sc);
-    case 'Pass': case 'Scope0': return;
+    case 'AnnDecl':
+      if(s.name){ sc.__anns = sc.__anns || []; if(sc.__anns.indexOf(s.name) < 0) sc.__anns.push(s.name); }
+      return;
+    case 'Pass': return;
+    case 'Scope0':
+      s.names.forEach(function(n){
+        if(s.kind === 'global') sc.declGlobal(n); else sc.declNonlocal(n);
+      });
+      return;
     case 'Break': return BRK;
     case 'Continue': return CNT;
     case 'Return': return new Ret(s.value ? yield* evalG(s.value, sc) : null);
@@ -1623,6 +1686,27 @@ function* execStmt(s, sc){
       var dict = new Map();
       cs.v.forEach(function(v,k){ dict.set(k,v); });
       var cls = new PyClass(s.name, bases, dict);
+      cls.__anns = cs.__anns || [];
+      dict.forEach(function(v){ if(v instanceof PyFunc && !v.__cls) v.__cls = cls; });
+      /* subclassing Enum turns each plain class attribute into a member */
+      if(bases.some(function(b){ return b.__enum; })){
+        cls.__enum = true;
+        var members = [];
+        var auto = 0;
+        dict.forEach(function(v, k){
+          if(k.indexOf('__') === 0 || v instanceof PyFunc || v instanceof PyNative) return;
+          var mo = new PyObj(cls);
+          auto += 1;
+          mo.fields.set('name', k);
+          mo.fields.set('value', v === null ? auto : v);
+          mo.__enumMember = true;
+          members.push(mo);
+          dict.set(k, mo);
+        });
+        cls.__members = members;
+        if(!dict.has('__repr__')) dict.set('__repr__', new PyNative('__repr__', function(a){
+          return cls.name + '.' + a[0].fields.get('name'); }));
+      }
       for(var d2=s.decorators.length-1; d2>=0; d2--) cls = call(evalE(s.decorators[d2], sc), [cls], null);
       sc.set(s.name, cls); return; }
     case 'Raise': {
@@ -1887,11 +1971,29 @@ function evalE(e, sc){
       });
       return o; }
     case 'FormatValue': return fmt(evalE(e.value,sc), e.spec);
-    case 'Tuple': return new PyTuple(e.items.map(function(x){return evalE(x,sc);}));
-    case 'List': return e.items.map(function(x){return evalE(x,sc);});
+    case 'Tuple': { var ti=[];
+      e.items.forEach(function(x){
+        if(x.k==='Spread') arr(evalE(x.value,sc)).forEach(function(y){ ti.push(y); });
+        else ti.push(evalE(x,sc));
+      });
+      return new PyTuple(ti); }
+    case 'List': { var out=[];
+      e.items.forEach(function(x){
+        if(x.k==='Spread') arr(evalE(x.value,sc)).forEach(function(y){ out.push(y); });
+        else out.push(evalE(x,sc));
+      });
+      return out; }
     case 'Set': return new PySet(e.items.map(function(x){return evalE(x,sc);}));
     case 'Dict': { var d=new PyDict();
-      e.keys.forEach(function(k,i){ d.set(evalE(k,sc), evalE(e.values[i],sc)); });
+      e.keys.forEach(function(k,i){
+        if(k === null){                       /* {**other} merges */
+          var src = evalE(e.values[i], sc);
+          if(!(src instanceof PyDict)) raise('TypeError','argument after ** must be a mapping');
+          src.items().forEach(function(p){ d.set(p.items[0], p.items[1]); });
+          return;
+        }
+        d.set(evalE(k,sc), evalE(e.values[i],sc));
+      });
       return d; }
     case 'UnaryOp': { var v2=evalE(e.e,sc);
       if(e.op==='-') return (v2 instanceof R.PyFloat) ? R.mkf(-num(v2)) : -num(v2);
@@ -1930,6 +2032,14 @@ function evalE(e, sc){
     case 'Slice': return sliceOf(evalE(e.obj,sc),
       e.lo?evalE(e.lo,sc):null, e.hi?evalE(e.hi,sc):null, e.step?evalE(e.step,sc):null);
     case 'Call': {
+      /* zero-argument super() needs the defining class and the instance,
+         which only the calling scope knows */
+      if(e.func.k==='Name' && e.func.v==='super' && !e.args.length){
+        var scls, sself;
+        try { scls = sc.get('__class__'); sself = sc.get('__self__'); }
+        catch(err){ raise('RuntimeError','super(): no arguments'); }
+        return new R.PySuper(scls, sself);
+      }
       var fn=evalE(e.func,sc), args=[], kw=null;
       e.args.forEach(function(a){
         if(a.kind==='pos') args.push(evalE(a.value,sc));
@@ -2279,6 +2389,10 @@ function builtins(){
   d('format', function(a){ return fmt(a[0], a.length>1?str(a[1]):null); });
   d('callable', function(a){ var v=a[0];
     return v instanceof PyFunc||v instanceof PyNative||v instanceof PyBound||v instanceof PyClass; });
+  d('property', function(a){ return new R.PyProp(a[0], null); });
+  d('staticmethod', function(a){ return new R.PyStatic(a[0]); });
+  d('classmethod', function(a){ return new R.PyClassM(a[0]); });
+  d('super', function(){ raise('RuntimeError','super() takes no arguments in this bench'); });
   d('open', function(){ raise('NotImplementedError','there is no filesystem in this bench \u2014 use a list of strings instead'); });
   d('input', function(){ raise('NotImplementedError','input() is not available in this bench'); });
   /* Built-in exceptions are real classes, so `class MyErr(ValueError)` works
@@ -2419,9 +2533,49 @@ function buildMods(){
     attrgetter:nat('attrgetter',function(a){ var ns=a.map(str);
       return nat('attrgetter',function(b){ var v=ns.map(function(n){return getattr(b[0],n);});
         return v.length===1?v[0]:new PyTuple(v); }); }) });
+  function makeDataclass(cls){
+    var fields = (cls.__anns || []).slice();
+    var defaults = {};
+    fields.forEach(function(f){ if(cls.dict.has(f)) defaults[f] = cls.dict.get(f); });
+    cls.__fields = fields;
+    cls.dict.set('__init__', nat('__init__', function(a, kw){
+      var self = a[0], rest = a.slice(1);
+      fields.forEach(function(f, i){
+        if(kw && kw.has(f)) self.fields.set(f, kw.get(f));
+        else if(i < rest.length) self.fields.set(f, rest[i]);
+        else if(f in defaults) self.fields.set(f, defaults[f]);
+        else raise('TypeError', cls.name + "() missing required argument: '" + f + "'");
+      });
+      return null;
+    }));
+    if(!cls.dict.has('__repr__')) cls.dict.set('__repr__', nat('__repr__', function(a){
+      var self = a[0];
+      return cls.name + '(' + fields.map(function(f){
+        return f + '=' + repr(self.fields.get(f)); }).join(', ') + ')';
+    }));
+    if(!cls.dict.has('__eq__')) cls.dict.set('__eq__', nat('__eq__', function(a){
+      var self = a[0], other = a[1];
+      if(!(other instanceof PyObj) || other.cls !== cls) return false;
+      return fields.every(function(f){ return eq(self.fields.get(f), other.fields.get(f)); });
+    }));
+    return cls;
+  }
   mk('dataclasses',{
-    dataclass:nat('dataclass',function(a){ return a.length?a[0]:nat('d',function(b){return b[0];}); }),
-    field:nat('field',function(a,kw){ return kw&&kw.has('default')?kw.get('default'):null; }) });
+    dataclass:nat('dataclass',function(a){
+      if(a.length && a[0] instanceof PyClass) return makeDataclass(a[0]);
+      return nat('dataclass', function(b){ return makeDataclass(b[0]); });
+    }),
+    field:nat('field',function(a,kw){ return kw&&kw.has('default')?kw.get('default'):null; }),
+    asdict:nat('asdict',function(a){
+      var o=a[0], d=new PyDict();
+      (o.cls.__fields||[]).forEach(function(f){ d.set(f, o.fields.get(f)); });
+      return d; }) });
+  var enumBase = new PyClass('Enum', [], new Map());
+  enumBase.__enum = true;
+  mk('enum', {
+    Enum: enumBase,
+    auto: nat('auto', function(){ return null; })
+  });
   mk('typing',{ List:'List', Dict:'Dict', Optional:'Optional', Any:'Any', Tuple:'Tuple',
     Iterator:'Iterator', Iterable:'Iterable', Callable:'Callable', Union:'Union', Set:'Set' });
   mk('time',{ time:nat('time',function(){return 1771200000.0;}),
@@ -3043,6 +3197,204 @@ qf: [
  ['Why will you not have production access?', 'Regulatory separation of duties — which is why logs and metrics matter more.']
 ]});
 
+M.push({
+code: 'V1', track: 'Tier 14 · Interview and career',
+title: 'The coding patterns they actually ask',
+sub: 'Six shapes cover most data-engineering screens. Not LeetCode — data shapes.',
+lede: 'A data-engineering screen is rarely a graph algorithm. It is almost always one of a small set of shapes over rows: group, deduplicate, join, aggregate in one pass, find the top N per group, and reconcile two sources. Each has an idiomatic Python answer that is short, and a naive answer that is O(n²).',
+ex: [
+ { t: 'Group rows by a key',
+   code: "from collections import defaultdict\n\ntxns = [\n    {\"id\": \"t1\", \"wallet\": \"w-1\", \"amount\": 100.0},\n    {\"id\": \"t2\", \"wallet\": \"w-2\", \"amount\": 250.0},\n    {\"id\": \"t3\", \"wallet\": \"w-1\", \"amount\": 75.0},\n]\n\nby_wallet = defaultdict(list)\nfor t in txns:\n    by_wallet[t[\"wallet\"]].append(t)\n\nfor w in sorted(by_wallet):\n    ids = [t[\"id\"] for t in by_wallet[w]]\n    print(w, ids)\n\n# the naive version is O(n^2):\n#   for w in wallets: [t for t in txns if t[\"wallet\"] == w]",
+   note: 'One pass, a dict of lists. The interviewer is watching for whether you scan the whole list once per key — which is quadratic and is the single most common inefficiency in a screen answer.' },
+ { t: 'Deduplicate, keeping the latest',
+   code: "rows = [\n    {\"id\": \"t1\", \"amount\": 100.0, \"ingested\": \"2026-02-13\"},\n    {\"id\": \"t1\", \"amount\": 110.0, \"ingested\": \"2026-02-14\"},\n    {\"id\": \"t2\", \"amount\": 250.0, \"ingested\": \"2026-02-13\"},\n]\n\nlatest = {}\nfor r in rows:\n    prev = latest.get(r[\"id\"])\n    if prev is None or r[\"ingested\"] > prev[\"ingested\"]:\n        latest[r[\"id\"]] = r\n\nfor k in sorted(latest):\n    print(k, latest[k][\"amount\"], latest[k][\"ingested\"])\n\nprint(\"kept\", len(latest), \"of\", len(rows))",
+   note: 'The follow-up is always "which duplicate wins?". Say it out loud: latest ingestion for corrections, earliest for immutable events. And note the tie case — if two share a timestamp the survivor is arbitrary unless you add a second sort key.' },
+ { t: 'Join two sources in memory',
+   code: "txns = [{\"id\": \"t1\", \"wallet\": \"w-1\"}, {\"id\": \"t2\", \"wallet\": \"w-9\"}]\nwallets = [{\"wallet\": \"w-1\", \"risk\": \"low\"}]\n\nindex = {w[\"wallet\"]: w for w in wallets}      # build a hash index once\n\njoined, unmatched = [], []\nfor t in txns:\n    w = index.get(t[\"wallet\"])\n    if w is None:\n        unmatched.append(t)                     # a LEFT join keeps these\n    else:\n        joined.append({**t, \"risk\": w[\"risk\"]})\n\nprint(\"joined:   \", joined)\nprint(\"unmatched:\", [t[\"id\"] for t in unmatched])\nprint(\"inner join would have silently dropped\", len(unmatched), \"row(s)\")",
+   note: 'Index the smaller side, then scan the larger once — the same idea as a broadcast hash join in Spark. The line that earns marks is the last one: naming what an inner join would have dropped.' },
+ { t: 'Aggregate several metrics in one pass',
+   code: "txns = [\n    {\"wallet\": \"w-1\", \"amount\": 100.0, \"flagged\": False},\n    {\"wallet\": \"w-1\", \"amount\": 950.0, \"flagged\": True},\n    {\"wallet\": \"w-2\", \"amount\": 40.0,  \"flagged\": False},\n]\n\nstats = {}\nfor t in txns:\n    s = stats.setdefault(t[\"wallet\"], {\"n\": 0, \"total\": 0.0, \"flagged\": 0, \"max\": 0.0})\n    s[\"n\"] += 1\n    s[\"total\"] += t[\"amount\"]\n    s[\"flagged\"] += 1 if t[\"flagged\"] else 0\n    s[\"max\"] = max(s[\"max\"], t[\"amount\"])\n\nfor w in sorted(stats):\n    s = stats[w]\n    print(f\"{w}: n={s['n']} total={s['total']:.2f} flagged={s['flagged']} max={s['max']:.2f}\")",
+   note: 'One traversal, four metrics. Filtering four times and joining the results is four passes for the same answer — and it is exactly the conditional-aggregation argument from SQL and Spark, in plain Python.' },
+ { t: 'Top N per group',
+   code: "txns = [\n    {\"wallet\": \"w-1\", \"id\": \"t1\", \"amount\": 100.0},\n    {\"wallet\": \"w-1\", \"id\": \"t2\", \"amount\": 900.0},\n    {\"wallet\": \"w-1\", \"id\": \"t3\", \"amount\": 500.0},\n    {\"wallet\": \"w-2\", \"id\": \"t4\", \"amount\": 40.0},\n]\n\ngroups = {}\nfor t in txns:\n    groups.setdefault(t[\"wallet\"], []).append(t)\n\nfor w in sorted(groups):\n    top = sorted(groups[w], key=lambda t: t[\"amount\"], reverse=True)[:2]\n    print(w, [(t[\"id\"], t[\"amount\"]) for t in top])",
+   note: 'Group, then sort within each group and slice. For very large groups you would use a bounded heap instead of sorting everything — saying that unprompted signals you have thought about the cost.' },
+ { t: 'Reconcile two sources',
+   code: "source = {\"t1\": 100.0, \"t2\": 250.0, \"t3\": 75.0}\ntarget = {\"t1\": 100.0, \"t2\": 999.0, \"t4\": 10.0}\n\nmissing = sorted(set(source) - set(target))\nextra   = sorted(set(target) - set(source))\ndiffers = sorted(k for k in set(source) & set(target) if source[k] != target[k])\n\nprint(\"in source, not loaded:\", missing)\nprint(\"in target, not in source:\", extra)\nprint(\"value mismatch:\", [(k, source[k], target[k]) for k in differs])\nprint(\"reconciled:\", not (missing or extra or differs))",
+   note: 'Set operations answer "the numbers are wrong" in four lines and turn a vague complaint into three specific lists. This is the shape of every reconciliation job you will ever write.' }
+],
+body: [
+ { h: 'The six shapes', html:
+   '<table><thead><tr><th>Ask</th><th>Shape</th><th>Cost</th></tr></thead><tbody><tr><td>"Group these by X"</td><td>dict of lists, one pass</td><td>O(n)</td></tr><tr><td>"Remove duplicates"</td><td>dict keyed on the business key</td><td>O(n)</td></tr><tr><td>"Combine these two"</td><td>Index the small side, scan the large</td><td>O(n+m)</td></tr><tr><td>"Summarise per group"</td><td>Accumulator dict, one pass</td><td>O(n)</td></tr><tr><td>"Top N per group"</td><td>Group, then sort or heap per group</td><td>O(n log k)</td></tr><tr><td>"Why do these disagree?"</td><td>Set difference and intersection</td><td>O(n+m)</td></tr></tbody></table>' },
+ { h: 'What they are actually checking', html:
+   '<ul><li><strong>Do you scan repeatedly?</strong> A nested loop over the same list is the tell.</li><li><strong>Do you name the ambiguity?</strong> Which duplicate wins, what happens to unmatched rows, how ties break.</li><li><strong>Do you handle empty input?</strong> Say it before they ask.</li><li><strong>Do you know when to stop?</strong> "Past a few million rows I would push this into SQL or Spark rather than a dict" is a better answer than optimising the dict.</li></ul>' },
+ { h: 'Say the cost out loud', html:
+   '<p>Dict and set lookup is O(1); scanning a list to find an item is O(n). Building an index and then looking up turns a quadratic loop into a linear one, and stating that transformation as you write it is most of what the interviewer wants to hear.</p>' }
+],
+call: '"Most data screens are one of six shapes over rows, and the one thing they all share is: build a dict index once rather than scanning the list per key. When I write one I say which duplicate wins and what happens to unmatched rows, because that ambiguity is usually the real question."',
+warn: 'Filtering a list inside a loop over its keys is O(n²) and looks perfectly readable. On the fifty rows in the interview it runs instantly; on the real data it never finishes, and nothing about the code says so.',
+qf: [
+ ['How do you group rows by a key?', 'One pass into a dict of lists — defaultdict(list) or setdefault.'],
+ ['What makes the naive grouping quadratic?', 'Scanning the whole list once per distinct key instead of once in total.'],
+ ['How do you join two lists in memory?', 'Index the smaller side into a dict, then scan the larger once.'],
+ ['What question follows any deduplication?', 'Which duplicate wins — and what breaks ties.'],
+ ['How do you compute several metrics per group?', 'One accumulator dict updated in a single pass, not one filter pass per metric.'],
+ ['How do you reconcile two sources?', 'Set difference both ways for missing and extra, intersection for value mismatches.'],
+ ['When do you stop optimising Python?', 'When the data outgrows one machine — then it belongs in SQL or Spark.']
+]});
+
+M.push({
+code: 'V2', track: 'Tier 14 · Interview and career',
+title: 'Reading someone else’s Python',
+sub: 'Code review is a real interview round. Here is what to look for, in order.',
+lede: 'You will be handed a function and asked what is wrong with it. The instinct is to comment on style; the value is in finding the defect. There is an order that finds real bugs fastest, and it maps onto every earlier tier of this bench.',
+ex: [
+ { t: 'Find the defects before reading on',
+   code: "def load_batch(rows, seen=[]):\n    results = []\n    for r in rows:\n        try:\n            if r[\"id\"] not in seen:\n                seen.append(r[\"id\"])\n                results.append({\"id\": r[\"id\"], \"amt\": float(r[\"amount\"])})\n        except:\n            pass\n    return results\n\nbatch = [{\"id\": \"t1\", \"amount\": \"10\"}, {\"id\": \"t2\", \"amount\": \"bad\"}]\nprint(\"run 1:\", load_batch(batch))\nprint(\"run 2:\", load_batch(batch))\nprint(\"second run returned nothing — state leaked between calls\")",
+   note: 'Five defects. The mutable default keeps state across calls, so the second run returns nothing. The bare except hides the bad row silently. `not in` on a list is O(n) so this is quadratic. There is no reject count. And the function name says load while it returns — it does neither cleanly.' },
+ { t: 'The reviewed version',
+   code: "def parse_batch(rows):\n    parsed, rejected = [], []\n    seen = set()\n    for r in rows:\n        try:\n            if r[\"id\"] in seen:\n                continue\n            seen.add(r[\"id\"])\n            parsed.append({\"id\": r[\"id\"], \"amt\": float(r[\"amount\"])})\n        except (ValueError, TypeError, KeyError) as e:\n            rejected.append({\"row\": r, \"reason\": str(e)})\n    return parsed, rejected\n\nbatch = [{\"id\": \"t1\", \"amount\": \"10\"}, {\"id\": \"t2\", \"amount\": \"bad\"}, {\"id\": \"t1\", \"amount\": \"10\"}]\ngood, bad = parse_batch(batch)\nprint(\"run 1:\", good, \"rejected:\", len(bad))\ngood, bad = parse_batch(batch)\nprint(\"run 2:\", good, \"rejected:\", len(bad))\nprint(\"identical across runs:\", True)",
+   note: 'State is local, the set makes membership O(1), rejects are returned rather than discarded, exceptions are named, and the function does one thing the name describes. Same length, entirely different behaviour under retry.' },
+ { t: 'A subtler one: the shared-default variant',
+   code: "def tally(txn, totals={}):\n    totals[txn[\"wallet\"]] = totals.get(txn[\"wallet\"], 0) + txn[\"amount\"]\n    return totals\n\nprint(tally({\"wallet\": \"w-1\", \"amount\": 10}))\nprint(tally({\"wallet\": \"w-2\", \"amount\": 20}))\nprint(\"w-1 is still here, from a previous call — and it is a memory leak\")",
+   note: 'This one passes review constantly because it looks like a pure accumulator. In a long-running worker the dict grows until the process dies, and the numbers are wrong from the second call onwards.' },
+ { t: 'The mutation review',
+   code: "def enrich(rows):\n    for r in rows:\n        r[\"band\"] = \"large\" if r[\"amount\"] > 100 else \"small\"\n    return rows\n\noriginal = [{\"id\": \"t1\", \"amount\": 500}]\nresult = enrich(original)\nprint(\"caller's data was modified:\", \"band\" in original[0])\nprint(\"same object returned:\", result is original)\n\ndef enrich_pure(rows):\n    return [dict(r, band=\"large\" if r[\"amount\"] > 100 else \"small\") for r in rows]\n\noriginal2 = [{\"id\": \"t1\", \"amount\": 500}]\nenrich_pure(original2)\nprint(\"pure version left it alone:\", \"band\" not in original2[0])",
+   note: 'The signature promises a return value and the body edits the input. Both are true, which is what makes it survive review — the caller has no copy of what they passed in and nothing warned them.' }
+],
+body: [
+ { h: 'The review order that finds bugs fastest', html:
+   '<ol><li><strong>Mutable defaults</strong> — any <code>=[]</code>, <code>={}</code>, or a call in a default.</li><li><strong>Bare or broad except</strong> — what is being swallowed, and is it counted?</li><li><strong>Mutation of arguments</strong> — does the caller keep their data?</li><li><strong>Accidental O(n²)</strong> — <code>in</code> on a list inside a loop.</li><li><strong>Re-runnability</strong> — what happens if this runs twice?</li><li><strong>Naming</strong> — does the name describe what it does?</li></ol><p>Style comes last and is mostly a linter’s job. Finding a mutable default before commenting on line length is the difference between reviewing and proofreading.</p>' },
+ { h: 'How to say it', html:
+   '<p>Lead with the consequence, not the rule. "This default dict is shared across calls, so the second invocation returns the first one’s data" lands; "avoid mutable defaults" sounds like a checklist. Then propose the fix, and say which of the defects you would block the merge on.</p>' },
+ { h: 'What good code looks like here', html:
+   '<ul><li>Pure transforms that return new objects.</li><li>Specific exceptions, with the rejects returned or logged.</li><li>Sets and dicts for membership, not lists.</li><li>One responsibility per function, and a name that says it.</li><li>Safe to run twice.</li></ul>' }
+],
+call: '"When I review Python I look for mutable defaults, bare excepts, argument mutation and accidental quadratic loops before I look at anything stylistic — those four cause real incidents. And I lead with the consequence rather than the rule, because \'the second call returns the first call’s data\' is more persuasive than \'avoid mutable defaults\'."',
+warn: 'A function that both mutates its argument and returns it passes review easily, because the return value makes it look pure. The caller keeps no copy of what they passed in, and the bug only surfaces when someone else reuses that data.',
+qf: [
+ ['What do you check first in a review?', 'Mutable defaults, bare excepts, argument mutation, and accidental O(n²) loops.'],
+ ['Why is `x in some_list` inside a loop a smell?', 'List membership is O(n), so the loop becomes quadratic — use a set.'],
+ ['Why does a mutating function that also returns survive review?', 'The return value makes it look pure, so nobody checks whether the input changed.'],
+ ['What is wrong with `except: pass`?', 'It converts a failure into silent data loss with a successful exit code.'],
+ ['How should you phrase a review comment?', 'Lead with the consequence, then the fix, then say whether it blocks the merge.'],
+ ['What question exposes most pipeline bugs?', 'What happens if this runs twice?']
+]});
+
+M.push({
+code: 'V3', track: 'Tier 14 · Interview and career',
+title: 'Debugging as a method',
+sub: 'Bisect, do not guess. The order matters more than the tools.',
+lede: 'Under pressure the instinct is to read the code and look for something wrong. That works for simple bugs and fails for the ones that matter. A method that narrows the search space beats intuition, and it is also what a panel is listening for when they hand you a broken function.',
+ex: [
+ { t: 'Narrow it by bisection, not by reading',
+   code: "def pipeline(rows):\n    stage1 = [r for r in rows if r.get(\"amount\") is not None]\n    stage2 = [dict(r, amount=float(r[\"amount\"])) for r in stage1]\n    stage3 = [r for r in stage2 if r[\"amount\"] > 0]\n    return stage3\n\nrows = [\n    {\"id\": \"t1\", \"amount\": \"100\"},\n    {\"id\": \"t2\"},\n    {\"id\": \"t3\", \"amount\": \"0\"},\n    {\"id\": \"t4\", \"amount\": \"250\"},\n]\n\n# instrument every hop, then read where the drop happened\ns1 = [r for r in rows if r.get(\"amount\") is not None]\ns2 = [dict(r, amount=float(r[\"amount\"])) for r in s1]\ns3 = [r for r in s2 if r[\"amount\"] > 0]\n\nprint(f\"in     {len(rows)}\")\nprint(f\"stage1 {len(s1)}   (-{len(rows)-len(s1)}: missing amount)\")\nprint(f\"stage2 {len(s2)}   (-{len(s1)-len(s2)})\")\nprint(f\"stage3 {len(s3)}   (-{len(s2)-len(s3)}: amount not > 0)\")",
+   note: 'Counts at every hop turn "rows are missing" into a specific stage in seconds. Reading the function first would have found it eventually; counting finds it immediately and works on code you have never seen.' },
+ { t: 'Reproduce it smaller before you fix it',
+   code: "def band(amount):\n    if amount > 1000:\n        return \"large\"\n    elif amount > 100:\n        return \"medium\"\n    return \"small\"\n\nfor a in [0, 100, 100.01, 1000, 1000.01, -5]:\n    print(f\"{a:>9} -> {band(a)}\")\n\nprint()\nprint(\"boundaries are the bug surface: 100 is 'small', 1000 is 'medium'\")\nprint(\"is that intended, or is one of them an off-by-one?\")",
+   note: 'A minimal reproduction is a table of boundary values. Half of all logic bugs live exactly on a boundary, and printing the boundaries settles in one line what arguing about the code would not.' },
+ { t: 'Assert your assumptions rather than believing them',
+   code: "def load(rows):\n    assert isinstance(rows, list), f\"expected list, got {type(rows).__name__}\"\n    assert all(\"id\" in r for r in rows), \"every row needs an id\"\n    seen = {r[\"id\"] for r in rows}\n    assert len(seen) == len(rows), f\"duplicate ids: {len(rows)-len(seen)}\"\n    return len(rows)\n\nprint(\"clean:\", load([{\"id\": \"t1\"}, {\"id\": \"t2\"}]))\n\nfor bad in [{\"id\": \"t1\"}, {\"id\": \"t1\"}]:\n    pass\ntry:\n    load([{\"id\": \"t1\"}, {\"id\": \"t1\"}])\nexcept AssertionError as e:\n    print(\"caught early:\", e)\ntry:\n    load([{\"amount\": 1}])\nexcept AssertionError as e:\n    print(\"caught early:\", e)",
+   note: 'An assertion converts a silent wrong answer into a loud failure at the point the assumption broke, rather than three stages later where the symptom appears. In a pipeline these become data quality gates.' },
+ { t: 'Binary search a long pipeline',
+   code: "stages = [\"extract\", \"clean\", \"dedupe\", \"enrich\", \"aggregate\", \"write\"]\ncounts  = [1000,      1000,    1000,     640,      640,         640]\n\nprint(\"stage      rows    delta\")\nprev = None\nfor s, c in zip(stages, counts):\n    delta = \"\" if prev is None else f\"{c - prev:+d}\"\n    flag = \"  <-- HERE\" if prev is not None and c != prev else \"\"\n    print(f\"{s:10} {c:5}  {delta:>6}{flag}\")\n    prev = c\n\nprint()\nprint(\"six stages, one comparison each — not six code reviews\")",
+   note: 'With counts recorded at each hop, finding the guilty stage is a scan rather than an investigation. This is why instrumenting a pipeline pays for itself the first time it breaks.' }
+],
+body: [
+ { h: 'The order', html:
+   '<ol><li><strong>Reproduce it</strong> — smallest input that still fails.</li><li><strong>Bisect</strong> — counts or prints at each hop; find the stage.</li><li><strong>Read the first error</strong>, not the last line of the traceback. The last frame is where it surfaced; the first is where it started.</li><li><strong>Check your assumptions</strong> with assertions, rather than trusting them.</li><li><strong>Change one thing</strong> and re-measure.</li><li><strong>Write the test</strong> that would have caught it, before fixing.</li></ol>' },
+ { h: 'Where data bugs actually hide', html:
+   '<table><thead><tr><th>Symptom</th><th>Usual cause</th></tr></thead><tbody><tr><td>Rows missing</td><td>Inner join, or a filter dropping nulls</td></tr><tr><td>Rows duplicated</td><td>A join fanning out, or a non-idempotent load</td></tr><tr><td>Totals slightly off</td><td>Float arithmetic, or a boundary condition</td></tr><tr><td>Totals wildly off</td><td>Double-counting from a re-run</td></tr><tr><td>Works on sample, fails on real data</td><td>Nulls, encoding, or scale</td></tr><tr><td>Intermittent</td><td>Ordering, concurrency, or a timezone boundary</td></tr></tbody></table>' },
+ { h: 'What not to do', html:
+   '<p>Do not change several things at once — if it starts working you have learned nothing and cannot revert intelligently. Do not fix the symptom before you understand the cause; a filter added to remove bad rows is usually hiding the reason they exist. And do not skip writing the test, because the same bug will arrive again through a different path.</p>' }
+],
+call: '"I bisect rather than read — counts at every hop turn \'rows are missing\' into a named stage in seconds, and it works on code I have never seen. Then I write the test that would have caught it before I write the fix, because otherwise the same bug comes back through a different path."',
+warn: 'The last frame of a traceback is where the error surfaced, not where it started. Fixing the line that raised often just moves the failure downstream — read the first error in the log, not the final one.',
+qf: [
+ ['First step when debugging?', 'Reproduce it with the smallest input that still fails.'],
+ ['How do you find which stage broke?', 'Bisect — record row counts at every hop and look for the drop.'],
+ ['Which part of a traceback matters most?', 'The first error, not the last frame — the last is where it surfaced.'],
+ ['What causes rows to go missing?', 'An inner join that should be left, or a filter dropping nulls.'],
+ ['What causes duplicates?', 'A join fanning out, or a non-idempotent load that ran twice.'],
+ ['Why change one thing at a time?', 'Otherwise a fix teaches you nothing and cannot be reverted intelligently.'],
+ ['What do you write before the fix?', 'The test that would have caught it.']
+]});
+
+M.push({
+code: 'V4', track: 'Tier 14 · Interview and career',
+title: 'Designing a pipeline out loud',
+sub: 'The structure of a good answer to "how would you build this?"',
+lede: 'A design question is not testing whether you know Airflow. It is testing whether you ask about the contract before the tooling, and whether you can name what you would not build. There is an order that makes the answer sound like experience rather than a diagram.',
+ex: [
+ { t: 'The questions before any code', ref:true,
+   code: "BEFORE naming a single tool:\n\n  1  Who consumes this, and what decision does it drive?\n  2  How fresh does it need to be?      (this is the real SLA)\n  3  What happens if it is late? if it is wrong?\n  4  How much data, and how fast is it growing?\n  5  Where does it come from, and who owns that source?\n  6  Can the source be replayed, or is it one-shot?\n  7  What is the grain of the output — one row per what?\n\nOnly now does \"batch or streaming\" have an answer.\nOnly now does \"Python or Spark\" have an answer.",
+   note: 'Most candidates start at step 8. Asking about consumers and freshness first is what separates a designer from someone reciting an architecture, and questions 6 and 7 are the ones that actually constrain the design.' },
+ { t: 'The shape of the answer', ref:true,
+   code: "SOURCE -> LAND -> CLEAN -> MODEL -> SERVE\n                   |        |        |\n                   +--------+--------+-- quality gates between each\n\nFor each hop, say:\n  what it does           one sentence\n  the grain              one row per what\n  idempotency            how a re-run behaves\n  failure mode           what breaks, and what you do about it\n  the check              the assertion that must return zero rows\n\nThen say what you are NOT building and why:\n  \"no streaming layer, because the SLA is daily and streaming\n   triples the operational surface for no benefit here\"",
+   note: 'Naming what you deliberately did not build is the strongest single signal available in a design round. It shows you priced the alternative rather than not knowing it existed.' },
+ { t: 'Sizing before choosing tools',
+   code: "daily_rows = 5_000_000\navg_row_bytes = 400\ndays_retained = 730\n\ndaily_gb = daily_rows * avg_row_bytes / 1e9\ntotal_gb = daily_gb * days_retained\n\nprint(f\"per day:   {daily_gb:>8.2f} GB\")\nprint(f\"retained:  {total_gb:>8.2f} GB\")\nprint(f\"per hour:  {daily_rows/24:>8,.0f} rows\")\nprint(f\"per second:{daily_rows/86400:>8,.0f} rows\")\nprint()\nprint(\"2 GB/day fits on one machine — Python and Parquet is enough\")\nprint(\"the 1.5 TB total is a storage and partitioning question, not a compute one\")",
+   note: 'Two lines of arithmetic decide whether this is a Python job or a Spark job, and doing it out loud is far more convincing than asserting either. Fifty-eight rows a second is not a streaming problem.' },
+ { t: 'The trade-off table you should reach for',
+   code: "options = [\n    (\"Batch, daily\",      \"simple, cheap, replayable\",     \"up to 24h stale\"),\n    (\"Batch, hourly\",     \"still simple, 24x the runs\",    \"up to 1h stale\"),\n    (\"Micro-batch, 5min\", \"streaming semantics, batch ops\", \"small-file pressure\"),\n    (\"Streaming\",         \"seconds fresh\",                 \"state, watermarks, on-call\"),\n]\n\nprint(f\"{'option':20} {'buys you':32} {'costs you'}\")\nfor name, pro, con in options:\n    print(f\"{name:20} {pro:32} {con}\")\n\nprint()\nprint(\"pick the cheapest row that meets the stated SLA — not the most impressive one\")",
+   note: 'Having the ladder ready means the answer to "would you stream this?" is a comparison rather than a preference. The last line is the whole point: the design follows the SLA, and the SLA came from question 2.' }
+],
+body: [
+ { h: 'The order that sounds like experience', html:
+   '<ol><li><strong>Consumers and contract</strong> — who reads it, what breaks if it is wrong.</li><li><strong>Freshness</strong> — the real SLA, not the aspirational one.</li><li><strong>Volume</strong> — do the arithmetic out loud.</li><li><strong>Grain</strong> — one row per what.</li><li><strong>Layers and gates</strong> — land, clean, model, serve, with a check between each.</li><li><strong>Idempotency</strong> — how a re-run behaves, per layer.</li><li><strong>Failure and observability</strong> — what alarms, on what signal.</li><li><strong>Tooling</strong> — last, and justified by the above.</li></ol>' },
+ { h: 'Say what you would not build', html:
+   '<ul><li>"No streaming, because the SLA is daily."</li><li>"No Spark, because two gigabytes a day fits on one machine."</li><li>"No custom framework, because Airflow already does this."</li><li>"No real-time dashboard, because nobody acts on it before morning."</li></ul><p>Each of those is a decision with a reason attached, and reasons are what a panel is grading.</p>' },
+ { h: 'The follow-ups that always come', html:
+   '<table><thead><tr><th>They ask</th><th>They want to hear</th></tr></thead><tbody><tr><td>"What if it fails halfway?"</td><td>Idempotency, and restartability if the run is long</td></tr><tr><td>"What if the source changes schema?"</td><td>A contract check that fails the run loudly</td></tr><tr><td>"How do you know it worked?"</td><td>Freshness, volume and reconciliation — not job status</td></tr><tr><td>"How would you backfill?"</td><td>Partition overwrite, in order, with counts per day</td></tr><tr><td>"What scales first?"</td><td>Name the actual bottleneck, not \\"add more workers\\"</td></tr></tbody></table>' }
+],
+call: '"I ask who consumes it and how fresh it must be before I name a tool, because those two answers decide batch versus streaming and Python versus Spark. Then I do the volume arithmetic out loud — five million rows a day at four hundred bytes is two gigabytes, which fits on one machine, so Spark would be complexity I could not justify."',
+warn: 'Answering a design question by naming an architecture is how candidates lose the round. Without asking about consumers, freshness and volume first, any architecture is a guess — and the follow-up "why streaming?" has no answer.',
+qf: [
+ ['What do you ask before naming tools?', 'Who consumes it, how fresh it must be, what breaks if it is wrong, and how much data there is.'],
+ ['What is the real SLA?', 'What happens when the output is late or wrong — not the number in a document.'],
+ ['Why do the volume arithmetic out loud?', 'It decides Python versus Spark with evidence instead of preference.'],
+ ['What should you say about each hop?', 'Its purpose, grain, idempotency, failure mode, and the check that gates it.'],
+ ['What is the strongest signal in a design round?', 'Naming what you deliberately did not build, and why.'],
+ ['How do you know a pipeline worked?', 'Freshness, volume against a baseline, and reconciliation — not job status.']
+]});
+
+M.push({
+code: 'V5', track: 'Tier 14 · Interview and career',
+title: 'Talking about your own code',
+sub: 'The project story, the trade-off you made, and the thing you got wrong.',
+lede: 'Every interview ends up here, and it is the round candidates prepare for least. The failure mode is describing what the system did rather than what you decided — a panel cannot grade a description, only a decision.',
+ex: [
+ { t: 'The project story, in a structure', ref:true,
+   code: "  CONTEXT   one sentence: what, for whom, at what scale\n  PROBLEM   what specifically was hard — not \"it was complex\"\n  OPTIONS   what you considered, and what each would have cost\n  DECISION  what you chose, and the constraint that decided it\n  RESULT    a number if you have one; honest if you do not\n  LEARNED   what you would do differently, specifically\n\nTwo minutes. Then stop and let them ask.\n\nThe two weakest words available are \"we\" and \"basically\".\nSay what YOU did, and say it precisely.",
+   note: 'OPTIONS and LEARNED are the two sections candidates skip, and they are the two the panel is grading. A decision with no discarded alternative is indistinguishable from a default.' },
+ { t: 'Turn a system description into a decision', ref:true,
+   code: "WEAK:\n  \"I built a pipeline that ingests transactions, cleans them,\n   and loads them into a warehouse using Airflow and Spark.\"\n   -> describes the diagram; grades as \"has seen a pipeline\"\n\nSTRONG:\n  \"The load had to be safe to re-run, because the source\n   occasionally re-sent a day. I chose partition overwrite over\n   a keyed merge — the merge would have needed a business key\n   I did not trust, and overwrite made a re-run naturally\n   idempotent. It cost a full day rewrite per run, which at\n   two gigabytes was a few minutes.\"\n   -> a constraint, an alternative, a decision, and its price",
+   note: 'Same project, completely different signal. The strong version names a constraint, an alternative that was rejected, and the cost of the choice. That is the shape of every good answer in this round.' },
+ { t: 'The failure question, answered well', ref:true,
+   code: "They ask: \"tell me about something that went wrong.\"\n\nDO NOT give a disguised strength (\"I care too much about quality\").\nDO NOT blame the source system, the previous team, or the deadline.\n\nDO give:\n  what broke, concretely\n  the impact, honestly — including if someone else caught it\n  what you did in the moment\n  what you changed so it cannot recur\n  and, ideally, that the change was a test or a check, not\n  \"I was more careful afterwards\"\n\n\"I was more careful\" is not a fix. A gate is a fix.",
+   note: 'The last line is the whole answer. Panels are listening for whether your fix was systemic or personal, because only one of those survives you moving teams.' },
+ { t: 'Have the numbers ready',
+   code: "claims = [\n    (\"rows processed daily\",  \"5M\"),\n    (\"runtime before / after\", \"3h -> 40min\"),\n    (\"what caused the drop\",  \"broadcast join instead of shuffle\"),\n    (\"cost before / after\",   \"$310/mo -> $95/mo\"),\n    (\"reject rate\",           \"0.02%, alarmed above 0.5%\"),\n]\n\nfor label, value in claims:\n    print(f\"{label:24} {value}\")\n\nprint()\nprint(\"if you cannot say the number, say so plainly —\")\nprint(\"an invented figure is the fastest way to lose the room\")",
+   note: 'Rehearse these before the interview, because trying to recall them live sounds like invention. And if you genuinely do not know a number, saying "I did not measure that" is far stronger than producing one that does not survive a follow-up.' }
+],
+body: [
+ { h: 'What the round is actually grading', html:
+   '<table><thead><tr><th>They hear</th><th>They conclude</th></tr></thead><tbody><tr><td>What the system did</td><td>You were present</td></tr><tr><td>What you decided, and why</td><td>You were responsible</td></tr><tr><td>What you rejected, and its cost</td><td>You understood the space</td></tr><tr><td>What you got wrong, and the gate you added</td><td>You are safe to hire</td></tr></tbody></table>' },
+ { h: 'Your own differentiator', html:
+   '<p>Most candidates have built a pipeline. Fewer have research behind theirs. When the work connects to something specific — a domain, a paper, a dataset with real difficulty — lead with the difficulty rather than the technology, because the technology is interchangeable and the difficulty is not.</p>' },
+ { h: 'Questions worth asking them', html:
+   '<ul><li>"What breaks most often, and who gets paged?"</li><li>"How do you know a pipeline produced correct data, not just that it ran?"</li><li>"What is the oldest thing still in production, and why has nobody replaced it?"</li><li>"What would you want the person in this role to have fixed in six months?"</li></ul><p>These read as operational experience rather than curiosity, and the answers tell you what the job is actually like.</p>' }
+],
+call: '"I try to describe decisions rather than systems — the constraint, the option I rejected and what it would have cost, then what I chose and its price. And when I talk about something going wrong, the fix I describe is a check or a test, because \'I was more careful afterwards\' does not survive me moving teams."',
+warn: 'Describing what the system did rather than what you decided is the most common way this round is lost. A panel cannot grade a diagram — and "we built" tells them nothing about what you personally chose.',
+qf: [
+ ['What structure works for a project story?', 'Context, problem, options, decision, result, learned — in about two minutes.'],
+ ['Which two sections do candidates skip?', 'The options they rejected, and what they learned.'],
+ ['Why is naming a rejected alternative important?', 'A decision with no discarded alternative is indistinguishable from a default.'],
+ ['How should you answer the failure question?', 'Concretely — what broke, the honest impact, and the check or test you added so it cannot recur.'],
+ ['Why is "I was more careful" a weak fix?', 'It is personal rather than systemic, so it does not survive you leaving.'],
+ ['What if you do not know a metric?', 'Say so plainly — an invented number fails the first follow-up.']
+]});
+
 root.PY_MODULES = M;
 })(typeof window !== 'undefined' ? window : (typeof globalThis !== 'undefined' ? globalThis : this));
 
@@ -3066,6 +3418,7 @@ var mods = [], navBtns = [], cur = 0, doneSet = {};
 /* Explicit learning order. Tracks render in this sequence regardless of the
    order modules were authored in; anything unlisted falls to the end. */
 var TRACK_ORDER = [
+  'Tier 14 \u00b7 Interview and career',
   'Level 1 \u00b7 How Python stores data',
   'Level 2 \u00b7 Memory and volume',
   'Level 3 \u00b7 When things go wrong',
