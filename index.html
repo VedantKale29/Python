@@ -1165,6 +1165,14 @@ function hkey(v){
     v.items.forEach(hkey);
     return kof(v);
   }
+  if(v instanceof PyObj){
+    /* honour __hash__; and defining __eq__ without __hash__ makes the
+       object unhashable, exactly as Python does */
+    var h = lookup(v, '__hash__');
+    if(h) return 'h' + kof(call(h, [], null));
+    if(lookup(v, '__eq__')) raise('TypeError', "unhashable type: '" + v.cls.name + "'");
+    return kof(v);
+  }
   return kof(v);
 }
 function PyDict(){ this.m = new Map(); }
@@ -1243,7 +1251,7 @@ function tname(v){
   if(v instanceof PyRange) return 'range';
   if(v instanceof PyFunc||v instanceof PyNative||v instanceof PyBound) return 'function';
   if(v instanceof PyClass) return 'type';
-  if(v instanceof PyGen) return 'generator';
+  if(v instanceof PyGen) return (v.name==='map'||v.name==='filter') ? v.name : 'generator';
   if(v instanceof PyModule) return 'module';
   if(v instanceof PyErr) return v.type;
   if(v instanceof PyObj) return v.cls.name;
@@ -1302,10 +1310,18 @@ function iter(v){
       var o=c; c+=st; return {value:o,done:false}; } }; }
   if(v instanceof PyGen) return v.iter;
   if(v instanceof PyObj){
-    var it=lookup(v,'__iter__'); if(it) return iter(call(it,[],null));
-    var nx=lookup(v,'__next__'); if(nx) return { next:function(){
+    var it=lookup(v,'__iter__');
+    if(it){
+      var res = call(it,[],null);
+      /* the iterator protocol allows __iter__ to return self; recursing on it
+         would loop forever, so fall through to __next__ in that case */
+      if(res !== v) return iter(res);
+    }
+    var nx=lookup(v,'__next__');
+    if(nx) return { next:function(){
       try { return {value:call(nx,[],null),done:false}; }
       catch(e){ if(e instanceof PyErr && e.type==='StopIteration') return {done:true}; throw e; } } };
+    if(it) raise('TypeError', "__iter__ returned self but the object has no __next__");
   }
   raise('TypeError',"'"+tname(v)+"' object is not iterable");
 }
@@ -1411,7 +1427,15 @@ Scope.prototype.bind = function(n, val){
   this.v.set(n, val);
 };
 Scope.prototype.get = function(n){
-  var s=this; while(s){ if(s.v.has(n)) return s.v.get(n); s=s.parent; }
+  var s=this;
+  while(s){
+    if(s.v.has(n)) return s.v.get(n);
+    /* a name that this function assigns is local, so stop searching outward */
+    if(s.__locals && s.__locals[n] &&
+       !(s.nl && s.nl.has(n)) && !(s.gl && s.gl.has(n)))
+      raise('UnboundLocalError', "cannot access local variable '"+n+"' where it is not associated with a value");
+    s=s.parent;
+  }
   raise('NameError',"name '"+n+"' is not defined");
 };
 Scope.prototype.set = function(n,val){ this.v.set(n,val); };
@@ -1430,15 +1454,37 @@ function excChain(c){
   (function w(k){ if(!k||seen.indexOf(k)>=0) return; seen.push(k); out.push(k.name); k.bases.forEach(w); })(c);
   return out;
 }
+/* C3 linearisation, as CPython uses: a class comes before its bases, and
+   bases keep their declared order. Depth-first search gets Both(Left,Right)
+   wrong by reaching Base before Right. */
+function mro(c){
+  if(c.__mro) return c.__mro;
+  var seqs = c.bases.map(mro).concat([c.bases.slice()]);
+  var out = [c];
+  seqs = seqs.map(function(x){ return x.slice(); });
+  for(;;){
+    seqs = seqs.filter(function(x){ return x.length; });
+    if(!seqs.length) break;
+    var head = null;
+    for(var i = 0; i < seqs.length; i++){
+      var cand = seqs[i][0];
+      var inTail = seqs.some(function(sq){ return sq.indexOf(cand) > 0; });
+      if(!inTail){ head = cand; break; }
+    }
+    if(head === null){ head = seqs[0][0]; }        /* inconsistent hierarchy: degrade gracefully */
+    out.push(head);
+    seqs.forEach(function(sq){ if(sq[0] === head) sq.shift(); });
+  }
+  c.__mro = out;
+  return out;
+}
 function clsLookup(c, name){
-  var seen=[];
-  return (function walk(k){
-    if(!k||seen.indexOf(k)>=0) return undefined;
-    seen.push(k);
-    if(k.dict.has(name)) return k.dict.get(name);
-    for(var i=0;i<k.bases.length;i++){ var r=walk(k.bases[i]); if(r!==undefined) return r; }
-    return undefined;
-  })(c);
+  if(!c) return undefined;
+  var order = mro(c);
+  for(var i = 0; i < order.length; i++){
+    if(order[i].dict.has(name)) return order[i].dict.get(name);
+  }
+  return undefined;
 }
 function lookup(o, name){
   if(o instanceof PyObj){
@@ -1452,9 +1498,13 @@ function lookup(o, name){
     return (pm instanceof PyFunc || pm instanceof PyNative) ? new PyBound(o, pm) : pm;
   }
   if(o instanceof R.PySuper){
-    /* skip past the defining class and search its bases */
+    /* the next class in the INSTANCE's MRO after the defining class */
+    var order = mro(o.self instanceof PyObj ? o.self.cls : o.cls);
+    var at = order.indexOf(o.cls);
     var found;
-    for(var i=0;i<o.cls.bases.length && found===undefined;i++) found = clsLookup(o.cls.bases[i], name);
+    for(var i = (at < 0 ? 1 : at + 1); i < order.length && found === undefined; i++){
+      if(order[i].dict.has(name)) found = order[i].dict.get(name);
+    }
     if(found===undefined) return undefined;
     if(found instanceof R.PyStatic) return found.fn;
     if(found instanceof R.PyClassM) return new PyBound(o.self.cls, found.fn);
@@ -1466,11 +1516,19 @@ function lookup(o, name){
 function getattr(o, name){
   var v = lookup(o, name);
   if(v!==undefined) return v;
+  if((o instanceof PyFunc || o instanceof PyNative) && o.__attrs && o.__attrs.has(name))
+    return o.__attrs.get(name);
+  if(o instanceof R.PyProp){
+    if(name === 'setter') return new PyNative('setter', function(a){ return new R.PyProp(o.fget, a[0]); });
+    if(name === 'getter') return new PyNative('getter', function(a){ return new R.PyProp(a[0], o.fset); });
+  }
   if(name === '__name__'){
     if(o instanceof PyClass || o instanceof PyFunc || o instanceof PyNative) return o.name;
     if(o instanceof PyModule) return o.name;
   }
   if(name === '__class__' && o instanceof PyObj) return o.cls;
+  if(name === '__dict__' && o instanceof PyObj && o.cls.__slots)
+    raise('AttributeError', "'"+o.cls.name+"' object has no attribute '__dict__'");
   if(name === '__dict__' && o instanceof PyObj){
     var d = new R.PyDict(); o.fields.forEach(function(val,k){ d.set(k,val); }); return d;
   }
@@ -1492,9 +1550,30 @@ function getattr(o, name){
   }
   var m = method(o, name);
   if(m) return m;
+  /* protocol dunders on built-in types, so hasattr() reports them honestly */
+  if(name === '__iter__'){
+    try { iter(o); return new PyNative('__iter__', function(a){ return new PyGen(iter(o), 'iterator'); }); }
+    catch(e){}
+  }
+  if(name === '__len__'){
+    try { plen(o); return new PyNative('__len__', function(){ return plen(o); }); }
+    catch(e){}
+  }
+  if(name === '__contains__' && (typeof o === 'string' || Array.isArray(o) ||
+      o instanceof PyTuple || o instanceof PyDict || o instanceof PySet || o instanceof PyRange))
+    return new PyNative('__contains__', function(a){ return R.has(o, a[0]); });
   raise('AttributeError',"'"+tname(o)+"' object has no attribute '"+name+"'");
 }
 function setattr(o,n,v){
+  if(o instanceof PyObj && o.cls.__slots && o.cls.__slots.indexOf(n) < 0)
+    raise('AttributeError', "'"+o.cls.name+"' object has no attribute '"+n+"'");
+  if(o instanceof PyObj && o.cls.__immutable)
+    raise('AttributeError', "can't set attribute '"+n+"' on immutable "+o.cls.name);
+  if(o instanceof PyFunc || o instanceof PyNative){
+    o.__attrs = o.__attrs || new Map();
+    o.__attrs.set(n, v);
+    return;
+  }
   if(o instanceof PyObj){
     var pm = clsLookup(o.cls, n);
     if(pm instanceof R.PyProp){
@@ -1513,6 +1592,7 @@ function call(f, args, kw){
   if(f instanceof PyBound) return call(f.fn, [f.self].concat(args), kw);
   if(f instanceof PyFunc){
     var sc = new Scope(f.closure);
+    sc.__locals = f.__locals;
     if(f.__cls){ sc.v.set('__class__', f.__cls); if(args.length && args[0] instanceof PyObj) sc.v.set('__self__', args[0]); }
     bind(f, args, kw, sc);
     if(f.isGen) return new PyGen(execBlockIter(f.body, sc), f.name);
@@ -1537,10 +1617,26 @@ function call(f, args, kw){
   raise('TypeError',"'"+tname(f)+"' object is not callable");
 }
 function bind(f, args, kw, sc){
-  var ps=f.params, i=0, used={};
+  var ps=f.params, i=0, used={}, kwOnly=false;
+  if(!ps.some(function(x){ return x.kind==='vararg'; })){
+    var nPos0 = 0, star0 = false;
+    ps.forEach(function(x){
+      if(x.kind==='kwonly'){ star0 = true; return; }
+      if(x.kind==='arg' && !star0) nPos0++;
+    });
+    if(args.length > nPos0)
+      raise('TypeError',(f.name||'function')+'() takes '+nPos0+
+        ' positional argument'+(nPos0===1?'':'s')+' but '+args.length+' were given');
+  }
   for(var p=0;p<ps.length;p++){
     var pr=ps[p];
-    if(pr.kind==='kwonly') continue;
+    if(pr.kind==='kwonly'){ kwOnly=true; continue; }
+    if(pr.kind==='arg' && kwOnly){
+      /* after a bare * these are keyword-only */
+      if(kw && kw.has(pr.name)){ sc.set(pr.name, kw.get(pr.name)); used[pr.name]=1; continue; }
+      if(f.defs && pr.name in f.defs){ sc.set(pr.name, f.defs[pr.name]); continue; }
+      raise('TypeError', (f.name||'function')+"() missing required keyword-only argument: '"+pr.name+"'");
+    }
     if(pr.kind==='vararg'){ sc.set(pr.name, new PyTuple(args.slice(i))); i=args.length; continue; }
     if(pr.kind==='kwarg'){ var d=new PyDict();
       if(kw) kw.forEach(function(v,k){ if(!used[k]) d.set(k,v); });
@@ -1550,9 +1646,15 @@ function bind(f, args, kw, sc){
     if(f.defs && pr.name in f.defs){ sc.set(pr.name, f.defs[pr.name]); continue; }
     raise('TypeError',(f.name||'function')+"() missing required positional argument: '"+pr.name+"'");
   }
-  if(!ps.some(function(x){return x.kind==='vararg';}) && i<args.length)
-    raise('TypeError',(f.name||'function')+'() takes '+ps.filter(function(x){return x.kind==='arg';}).length+
-      ' positional arguments but '+args.length+' were given');
+  if(!ps.some(function(x){return x.kind==='vararg';}) && i<args.length){
+    var nPos = 0, seenStar = false;
+    ps.forEach(function(x){
+      if(x.kind==='kwonly'){ seenStar = true; return; }
+      if(x.kind==='arg' && !seenStar) nPos++;
+    });
+    raise('TypeError',(f.name||'function')+'() takes '+nPos+
+      ' positional argument'+(nPos===1?'':'s')+' but '+args.length+' were given');
+  }
 }
 function execBlockIter(body, sc){
   var g = execBlock(body, sc);
@@ -1600,6 +1702,37 @@ function assign(t, val, sc){
 
 var BRK={s:1}, CNT={s:2};
 function Ret(v){ this.v=v; this.__ret=true; }
+
+/* Python decides a function's local names when it compiles the body, which is
+   why reading before assigning raises UnboundLocalError rather than finding an
+   outer binding. Collect the assigned names once, at definition. */
+function localNames(body){
+  var names = {};
+  function tgt(t){
+    if(!t) return;
+    if(t.k==='Name'){ names[t.v]=true; return; }
+    if(t.k==='Tuple'||t.k==='List'){ (t.items||[]).forEach(tgt); return; }
+    if(t.k==='Starred'){ tgt(t.value); return; }
+  }
+  function walk(sts){
+    (sts||[]).forEach(function(st){
+      if(!st) return;
+      if(st.k==='FunctionDef'||st.k==='ClassDef'){ names[st.name]=true; return; }
+      if(st.k==='Assign'){ (st.targets||[]).forEach(tgt); }
+      if(st.k==='AugAssign'){ tgt(st.target); }
+      if(st.k==='AnnDecl' && st.name){ names[st.name]=true; }
+      if(st.k==='For'){ tgt(st.target); }
+      if(st.k==='With'){ (st.items||[]).forEach(function(it){ if(it.name) names[it.name]=true; }); }
+      if(st.k==='Import'){ (st.mods||[]).forEach(function(m){ names[m.alias||m.name.split('.')[0]]=true; }); }
+      if(st.k==='ImportFrom'){ (st.names||[]).forEach(function(n){ names[n.alias||n.name]=true; }); }
+      if(st.k==='Try'){ (st.handlers||[]).forEach(function(h){ if(h.name) names[h.name]=true; walk(h.body); }); }
+      ['body','orelse','finalbody'].forEach(function(k){ if(st[k]) walk(st[k]); });
+      if(st.k==='Suite') walk(st.body);
+    });
+  }
+  walk(body);
+  return names;
+}
 
 function hasYield(body){
   var f=false;
@@ -1677,6 +1810,7 @@ function* execStmt(s, sc){
       var defs={};
       s.params.forEach(function(p){ if(p.kind==='arg'&&p.def) defs[p.name]=evalE(p.def, sc); });
       var fn = new PyFunc(s.name, s.params, s.body, sc, hasYield(s.body), defs);
+      fn.__locals = localNames(s.body);
       for(var d=s.decorators.length-1; d>=0; d--) fn = call(evalE(s.decorators[d], sc), [fn], null);
       sc.set(s.name, fn); return; }
     case 'ClassDef': {
@@ -1687,6 +1821,10 @@ function* execStmt(s, sc){
       cs.v.forEach(function(v,k){ dict.set(k,v); });
       var cls = new PyClass(s.name, bases, dict);
       cls.__anns = cs.__anns || [];
+      if(dict.has('__slots__')){
+        var sl = dict.get('__slots__');
+        cls.__slots = (sl instanceof PyTuple ? sl.items : (Array.isArray(sl) ? sl : [sl])).map(str);
+      }
       dict.forEach(function(v){ if(v instanceof PyFunc && !v.__cls) v.__cls = cls; });
       /* subclassing Enum turns each plain class attribute into a member */
       if(bases.some(function(b){ return b.__enum; })){
@@ -1803,7 +1941,7 @@ function excName(t){
   if(t instanceof PyNative) return t.__exc || t.name;
   return str(t);
 }
-root.__PYE = { execBlock:execBlock, isExcClass:isExcClass, excChain:excChain, Scope:Scope, lookup:lookup, getattr:getattr, setattr:setattr,
+root.__PYE = { execBlock:execBlock, mro:mro, isExcClass:isExcClass, excChain:excChain, Scope:Scope, lookup:lookup, getattr:getattr, setattr:setattr,
   call:call, clsLookup:clsLookup, assign:assign, tick:tick, ST:ST, OUT:OUT, Ret:Ret, nidx:nidx };
 function evalE(){ return root.__PYX.evalE.apply(null, arguments); }
 function evalG(){ return root.__PYX.evalG.apply(null, arguments); }
@@ -2134,9 +2272,21 @@ function nat(n,f){ return new PyNative(n,f); }
 function lazy(a,n){ var i=0; return new PyGen({ next:function(){ return i<a.length?{value:a[i++],done:false}:{done:true}; } }, n); }
 function srt(items, kw){
   var key = kw && kw.get('key'), rev = kw && truthy(kw.get('reverse'));
-  var a = items.slice();
-  a.sort(function(x,y){ var c = key ? cmpv(call(key,[x],null), call(key,[y],null)) : cmpv(x,y); return rev?-c:c; });
-  return a;
+  if(!key){
+    var plain = items.slice();
+    plain.sort(function(x,y){ var c = cmpv(x,y); return rev?-c:c; });
+    return plain;
+  }
+  /* decorate-sort-undecorate: the key runs ONCE per element, not per
+     comparison, which is what CPython does and what makes an expensive
+     key affordable */
+  var dec = items.map(function(x, i){ return { k: call(key,[x],null), i: i, v: x }; });
+  dec.sort(function(x,y){
+    var c = cmpv(x.k, y.k);
+    if(c === 0) return x.i - y.i;          /* stable */
+    return rev ? -c : c;
+  });
+  return dec.map(function(d){ return d.v; });
 }
 /* ---------------- type methods ---------------- */
 function method(o, n){
@@ -2361,7 +2511,19 @@ function builtins(){
     if(v instanceof PyObj){ var chain=[], seen=[];
       (function w(c){ if(!c||seen.indexOf(c)>=0) return; seen.push(c); chain.push(c.name); c.bases.forEach(w); })(v.cls);
       return names.some(function(n){ return chain.indexOf(n)>=0||n==='object'; }); }
-    if(v instanceof PyErr) return names.some(function(n){ return n===v.type||n==='Exception'||n==='object'; });
+    if(v instanceof PyErr) return names.some(function(n){
+      if(n==='object'||n==='BaseException') return true;
+      if(n===v.type) return true;
+      if((v.__bases||[]).indexOf(n)>=0) return true;      /* custom hierarchies */
+      var tree = { ValueError:['Exception'], TypeError:['Exception'], KeyError:['LookupError','Exception'],
+        IndexError:['LookupError','Exception'], ZeroDivisionError:['ArithmeticError','Exception'],
+        AttributeError:['Exception'], NameError:['Exception'], StopIteration:['Exception'],
+        RuntimeError:['Exception'], AssertionError:['Exception'], ImportError:['Exception'],
+        FileNotFoundError:['OSError','Exception'], NotImplementedError:['RuntimeError','Exception'],
+        LookupError:['Exception'], ArithmeticError:['Exception'], OSError:['Exception'],
+        UnboundLocalError:['NameError','Exception'] };
+      return (tree[v.type]||[]).indexOf(n)>=0;
+    });
     var tn=tname(v);
     return names.some(function(n){
       if(n==='object') return true;
@@ -2477,14 +2639,67 @@ function buildMods(){
     defaultdict:nat('defaultdict',function(a){ var d=new PyDict(); d.__factory=a.length?a[0]:null; return d; }),
     OrderedDict:nat('OrderedDict',function(a){ var d=new PyDict();
       if(a.length) arr(a[0]).forEach(function(p){var it=arr(p); d.set(it[0],it[1]);}); return d; }),
-    deque:nat('deque',function(a){ return a.length?arr(a[0]):[]; }),
+    deque:nat('deque',function(a){
+      /* a real deque: O(1) at both ends, unlike list.insert(0, x) */
+      var cls = new PyClass('deque', [], new Map());
+      var items = a.length ? arr(a[0]) : [];
+      var o = new PyObj(cls);
+      o.__items = items;
+      function m(n, f){ cls.dict.set(n, new PyNative(n, f)); }
+      m('append',      function(b){ b[0].__items.push(b[1]); return null; });
+      m('appendleft',  function(b){ b[0].__items.unshift(b[1]); return null; });
+      m('pop',         function(b){ var it=b[0].__items;
+                         if(!it.length) raise('IndexError','pop from an empty deque');
+                         return it.pop(); });
+      m('popleft',     function(b){ var it=b[0].__items;
+                         if(!it.length) raise('IndexError','pop from an empty deque');
+                         return it.shift(); });
+      m('extend',      function(b){ arr(b[1]).forEach(function(x){ b[0].__items.push(x); }); return null; });
+      m('clear',       function(b){ b[0].__items.length = 0; return null; });
+      m('__len__',     function(b){ return b[0].__items.length; });
+      m('__iter__',    function(b){ return new PyGen(iter(b[0].__items.slice()), 'deque_iterator'); });
+      m('__getitem__', function(b){ var it=b[0].__items, i=num(b[1]);
+                         if(i<0) i+=it.length;
+                         if(i<0||i>=it.length) raise('IndexError','deque index out of range');
+                         return it[i]; });
+      m('__contains__',function(b){ return R.has(b[0].__items, b[1]); });
+      m('__repr__',    function(b){ return 'deque([' + b[0].__items.map(repr).join(', ') + '])'; });
+      return o; }),
     namedtuple:nat('namedtuple',function(a){
       var nm=str(a[0]);
       var fs = typeof a[1]==='string' ? a[1].split(/[,\s]+/).filter(Boolean) : arr(a[1]).map(str);
       var cls=new PyClass(nm,[],new Map());
-      var ctor=nat(nm,function(args,kw){ var o=new PyObj(cls);
-        fs.forEach(function(f,i){ o.fields.set(f, kw&&kw.has(f)?kw.get(f):args[i]); }); return o; });
-      ctor.__cls=cls; return ctor; }) });
+      cls.__fields = fs;
+      cls.__immutable = true;
+      function vals(o){ return fs.map(function(f){ return o.fields.get(f); }); }
+      cls.dict.set('__iter__', new PyNative('__iter__', function(a){
+        return new PyGen(iter(vals(a[0])), 'tuple_iterator'); }));
+      cls.dict.set('__len__', new PyNative('__len__', function(){ return fs.length; }));
+      cls.dict.set('__getitem__', new PyNative('__getitem__', function(a){
+        var v = vals(a[0]), i = num(a[1]);
+        if(i < 0) i += v.length;
+        if(i < 0 || i >= v.length) raise('IndexError','tuple index out of range');
+        return v[i]; }));
+      cls.dict.set('__eq__', new PyNative('__eq__', function(a){
+        var o = a[1];
+        if(o instanceof PyObj && o.cls === cls) return eq(vals(a[0]), vals(o));
+        if(o instanceof PyTuple) return eq(vals(a[0]), o.items);
+        return false; }));
+      cls.dict.set('__hash__', new PyNative('__hash__', function(a){
+        return R.kof(new PyTuple(vals(a[0]))); }));
+      cls.dict.set('__repr__', new PyNative('__repr__', function(a){
+        return nm + '(' + fs.map(function(f){ return f + '=' + repr(a[0].fields.get(f)); }).join(', ') + ')'; }));
+      cls.dict.set('_asdict', new PyNative('_asdict', function(a){
+        var d = new PyDict(); fs.forEach(function(f){ d.set(f, a[0].fields.get(f)); }); return d; }));
+      var ctor=nat(nm,function(args,kw){
+        var o=new PyObj(cls);
+        fs.forEach(function(f,i){
+          if(kw&&kw.has(f)) o.fields.set(f, kw.get(f));
+          else if(i < args.length) o.fields.set(f, args[i]);
+          else raise('TypeError', nm+"() missing required argument: '"+f+"'");
+        });
+        return o; });
+      ctor.__cls=cls; ctor.__exc=null; return ctor; }) });
   mk('itertools',{
     count:nat('count',function(a){ var i=a.length?num(a[0]):0, st=a.length>1?num(a[1]):1;
       return new PyGen({ next:function(){ tick(); var v=i; i+=st; return {value:v,done:false}; } },'count'); }),
@@ -2499,7 +2714,10 @@ function buildMods(){
       while(i<stop){ var r=it.next(); if(r.done) break; if(i>=start) o.push(r.value); i++; }
       return lazy(o,'islice'); }),
     chain:nat('chain',function(a){ var o=[]; a.forEach(function(x){ arr(x).forEach(function(y){o.push(y);}); }); return lazy(o,'chain'); }),
-    groupby:nat('groupby',function(a){ var it=arr(a[0]), key=a.length>1?a[1]:null, o=[];
+    groupby:nat('groupby',function(a,kw){
+      var it=arr(a[0]);
+      var key = (kw && kw.has('key')) ? kw.get('key') : (a.length>1 ? a[1] : null);
+      var o=[];
       it.forEach(function(x){ var k=key?call(key,[x],null):x;
         if(o.length&&eq(o[o.length-1].items[0],k)) o[o.length-1].items[1].push(x);
         else o.push(new PyTuple([k,[x]])); });
@@ -2508,6 +2726,43 @@ function buildMods(){
       (function pick(s,c){ if(c.length===r){o.push(new PyTuple(c.slice())); return;}
         for(var i=s;i<x.length;i++){c.push(x[i]); pick(i+1,c); c.pop();} })(0,[]);
       return o; }),
+    tee:nat('tee',function(a){
+      var src=arr(a[0]), n=a.length>1?num(a[1]):2, o=[];
+      for(var i=0;i<n;i++) o.push(lazy(src.slice(),'tee'));
+      return new PyTuple(o); }),
+    accumulate:nat('accumulate',function(a){
+      var src=arr(a[0]), fn=a.length>1?a[1]:null, o=[], acc;
+      src.forEach(function(x,i){
+        acc = i===0 ? x : (fn ? call(fn,[acc,x],null) : X.binop('+',acc,x));
+        o.push(acc); });
+      return lazy(o,'accumulate'); }),
+    starmap:nat('starmap',function(a){
+      var fn=a[0];
+      return lazy(arr(a[1]).map(function(t){ return call(fn, arr(t), null); }),'starmap'); }),
+    takewhile:nat('takewhile',function(a){
+      var fn=a[0], o=[], it=iter(a[1]), r;
+      while(!(r=it.next()).done){ if(!truthy(call(fn,[r.value],null))) break; o.push(r.value); }
+      return lazy(o,'takewhile'); }),
+    dropwhile:nat('dropwhile',function(a){
+      var fn=a[0], o=[], dropping=true;
+      arr(a[1]).forEach(function(x){
+        if(dropping && truthy(call(fn,[x],null))) return;
+        dropping=false; o.push(x); });
+      return lazy(o,'dropwhile'); }),
+    filterfalse:nat('filterfalse',function(a){
+      var fn=a[0];
+      return lazy(arr(a[1]).filter(function(x){
+        return !(fn===null?truthy(x):truthy(call(fn,[x],null))); }),'filterfalse'); }),
+    zip_longest:nat('zip_longest',function(a,kw){
+      var fill = kw&&kw.has('fillvalue')?kw.get('fillvalue'):null;
+      var ls=a.map(function(x){return arr(x);});
+      var n=Math.max.apply(null,ls.map(function(l){return l.length;}).concat([0])), o=[];
+      for(var i=0;i<n;i++) o.push(new PyTuple(ls.map(function(l){ return i<l.length?l[i]:fill; })));
+      return lazy(o,'zip_longest'); }),
+    pairwise:nat('pairwise',function(a){
+      var src=arr(a[0]), o=[];
+      for(var i=0;i+1<src.length;i++) o.push(new PyTuple([src[i],src[i+1]]));
+      return lazy(o,'pairwise'); }),
     product:nat('product',function(a){ var ls=a.map(function(x){return arr(x);}), o=[];
       (function b(i,c){ if(i===ls.length){o.push(new PyTuple(c.slice())); return;}
         ls[i].forEach(function(x){ b(i+1,c.concat([x])); }); })(0,[]);
@@ -2521,7 +2776,20 @@ function buildMods(){
       if(a.length && (a[0] instanceof PyFunc||a[0] instanceof PyNative)) return memoize(a[0]);
       return nat('decorator',function(b){ return memoize(b[0]); }); }),
     cache:nat('cache',function(a){ return memoize(a[0]); }),
-    wraps:nat('wraps',function(){ return nat('decorator',function(b){ return b[0]; }); }),
+    wraps:nat('wraps',function(a){
+      /* copy the wrapped function's identity onto the wrapper */
+      var orig = a[0];
+      return nat('decorator', function(b){
+        var w = b[0];
+        if(orig && (w instanceof PyFunc || w instanceof PyNative)){
+          w.name = orig.name;
+          w.__wrapped = orig;
+          if(orig.__attrs){ w.__attrs = w.__attrs || new Map();
+            orig.__attrs.forEach(function(v,k){ if(!w.__attrs.has(k)) w.__attrs.set(k,v); }); }
+        }
+        return w;
+      });
+    }),
     partial:nat('partial',function(a){ var fn=a[0], bd=a.slice(1);
       return nat('partial',function(b,kw){ return call(fn,bd.concat(b),kw); }); }) });
   mk('operator',{
@@ -3395,6 +3663,810 @@ qf: [
  ['What if you do not know a metric?', 'Say so plainly — an invented number fails the first follow-up.']
 ]});
 
+M.push({
+code: 'U1', track: 'Tier 3 · Functions',
+title: 'Scope and the LEGB rule',
+sub: 'Where a name is looked up, and where assignment creates one.',
+lede: 'Python resolves a name by searching four scopes in order: <em class="hl">Local, Enclosing, Global, Built-in</em>. Reading follows that chain outward. Assignment does not — assigning to a name anywhere in a function makes it local for the <strong>whole</strong> function, which produces the single most confusing error in the language.',
+ex: [
+ { t: 'Reading walks outward',
+   code: "x = \"global\"\n\ndef outer():\n    x = \"enclosing\"\n    def inner():\n        return x            # not local -> found in enclosing\n    return inner()\n\ndef uses_global():\n    return x                # not local, not enclosing -> global\n\nprint(outer())\nprint(uses_global())\nprint(len(\"builtin\"))       # len is found in the builtin scope",
+   note: 'Four scopes, searched in order, stopping at the first match. Nothing here is surprising — the surprise is entirely on the assignment side.' },
+ { t: 'Assignment makes a name local for the entire function',
+   code: "count = 10\n\ndef broken():\n    print(\"before:\", count)   # <- fails: count is local because of line below\n    count = count + 1\n    return count\n\ntry:\n    broken()\nexcept Exception as e:\n    print(\"UnboundLocalError-style failure:\", e)\n\ndef works():\n    local_count = count + 1   # reads the global, binds a NEW name\n    return local_count\n\nprint(\"works():\", works(), \" global untouched:\", count)",
+   note: 'The error happens on the line BEFORE the assignment. Python decides a function’s local names when it compiles the body, so `count = count + 1` anywhere makes every reference to `count` in that function local — including earlier ones.' },
+ { t: 'global and nonlocal, and what each targets',
+   code: "total = 0\n\ndef add_global(n):\n    global total\n    total += n\n\nadd_global(5)\nadd_global(3)\nprint(\"module-level total:\", total)\n\ndef make_counter():\n    count = 0\n    def inc():\n        nonlocal count      # the ENCLOSING function, not the module\n        count += 1\n        return count\n    return inc\n\nc = make_counter()\nprint(\"counter:\", c(), c(), c())\nprint(\"independent:\", make_counter()())",
+   note: '`global` targets module scope; `nonlocal` targets the nearest enclosing function scope. Two counters made by the same factory are independent, because each call to make_counter creates a fresh `count`.' },
+ { t: 'Loops and comprehensions do not create scope the same way',
+   code: "for i in range(3):\n    pass\nprint(\"loop variable leaks:\", i)\n\nsquares = [n * n for n in range(3)]\ntry:\n    print(n)\nexcept NameError as e:\n    print(\"comprehension variable does NOT leak:\", e)\n\ntotal = 0\nfor v in [1, 2, 3]:\n    total += v          # no `global` needed — same scope\nprint(\"total:\", total)",
+   note: 'A `for` loop shares the enclosing scope, so its variable survives the loop. A comprehension has its own scope, so its variable does not. That difference is a genuine Python 3 behaviour and a common quiz question.' }
+],
+body: [
+ { h: 'The four scopes', html:
+   '<div class="pre">L  Local       inside the current function\nE  Enclosing   any function wrapping it\nG  Global      module level\nB  Built-in     print, len, range, ...</div><p>Reading searches L → E → G → B and stops at the first hit. Assignment binds locally unless you declare otherwise.</p>' },
+ { h: 'The rules that actually bite', html:
+   '<table><thead><tr><th>Situation</th><th>Behaviour</th></tr></thead><tbody><tr><td>Read a name never assigned in the function</td><td>Searches outward</td></tr><tr><td>Assign a name anywhere in the function</td><td><b>Local for the whole function</b></td></tr><tr><td>Mutate without assigning (<code>xs.append</code>)</td><td>No declaration needed</td></tr><tr><td><code>global x</code></td><td>Assignment targets module scope</td></tr><tr><td><code>nonlocal x</code></td><td>Assignment targets the enclosing function</td></tr></tbody></table><p>The third row explains why <code>xs.append(1)</code> works on an outer list without any declaration while <code>xs = xs + [1]</code> does not — one mutates, the other assigns.</p>' },
+ { h: 'Why you rarely want global', html:
+   '<p>A function that reads and writes module state is untestable in isolation and unsafe to run twice, which is Tier 12 arriving early. Pass what the function needs and return what it produces. <code>nonlocal</code> is narrower and more defensible — a closure holding a counter or a cache is a legitimate pattern.</p>' }
+],
+call: '"Reading a name searches local, enclosing, global then builtin, but assigning to it anywhere in a function makes it local for the entire function — which is why the UnboundLocalError fires on a line before the assignment. Mutating an outer object needs no declaration, because mutation is not assignment."',
+warn: 'The UnboundLocalError points at a line that looks perfectly fine, because the cause is an assignment further down. Python decides local names when it compiles the function, not when it reaches the line.',
+qf: [
+ ['What does LEGB stand for?', 'Local, Enclosing, Global, Built-in — the name resolution order.'],
+ ['What makes a name local?', 'Assigning to it anywhere in the function, including after the line that fails.'],
+ ['Why does the error appear before the assignment?', 'Local names are decided when the function is compiled, not line by line.'],
+ ['Does mutating an outer list need a declaration?', 'No — mutation is not assignment, so xs.append() works without global.'],
+ ['global versus nonlocal?', 'global targets module scope; nonlocal targets the nearest enclosing function.'],
+ ['Does a comprehension variable leak?', 'No — a comprehension has its own scope. A for loop variable does leak.']
+]});
+
+M.push({
+code: 'U2', track: 'Tier 3 · Functions',
+title: 'Arguments in depth',
+sub: 'Positional, keyword, defaults, *args, **kwargs — and the order they must appear in.',
+lede: 'Python’s calling convention is unusually flexible, which makes it easy to write a signature that is ambiguous or impossible to call correctly. Knowing the ordering rules and what each form is actually for turns that flexibility into a design tool.',
+ex: [
+ { t: 'The full signature, exercised',
+   code: "def load(table, *rows, mode=\"append\", strict=False, **options):\n    return {\n        \"table\": table,\n        \"rows\": len(rows),\n        \"mode\": mode,\n        \"strict\": strict,\n        \"options\": options,\n    }\n\nprint(load(\"txns\"))\nprint(load(\"txns\", {\"id\": 1}, {\"id\": 2}))\nprint(load(\"txns\", {\"id\": 1}, mode=\"overwrite\", strict=True))\nprint(load(\"txns\", retries=3, timeout=30))",
+   note: '`*rows` collects extra positional arguments into a tuple; `**options` collects extra keyword arguments into a dict. Anything after `*rows` can only be passed by keyword — which is often exactly what you want.' },
+ { t: 'Keyword-only arguments prevent unreadable calls',
+   code: "def write(rows, *, mode, partition=None):\n    return f\"{len(rows)} rows, mode={mode}, partition={partition}\"\n\nprint(write([1, 2], mode=\"overwrite\"))\nprint(write([1, 2], mode=\"append\", partition=\"2026-02-01\"))\n\ntry:\n    write([1, 2], \"overwrite\")\nexcept TypeError as e:\n    print(\"positional refused:\", e)",
+   note: 'The bare `*` marks everything after it keyword-only. It turns `write(rows, True, False)` — which nobody can read — into a call that has to name what it means. Worth doing for any boolean or mode parameter.' },
+ { t: 'Unpacking at the call site',
+   code: "def report(table, mode, partition):\n    return f\"{table} / {mode} / {partition}\"\n\nargs = [\"txns\", \"overwrite\"]\nkwargs = {\"partition\": \"2026-02-01\"}\n\nprint(report(*args, **kwargs))\n\nconfig = {\"table\": \"alerts\", \"mode\": \"append\", \"partition\": \"2026-02-02\"}\nprint(report(**config))\n\ndefaults = {\"mode\": \"append\", \"partition\": None}\noverride = {\"partition\": \"2026-02-03\"}\nprint(report(table=\"txns\", **{**defaults, **override}))",
+   note: '`*` and `**` unpack at the call site as well as collecting at the definition. The last line is the idiom for layering configuration — defaults merged with overrides, later keys winning.' },
+ { t: 'Defaults are evaluated once, at definition',
+   code: "CALLS = []\n\ndef make_default():\n    CALLS.append(1)\n    return len(CALLS)\n\ndef f(x, stamp=make_default()):\n    return x, stamp\n\nprint(f(\"a\"))\nprint(f(\"b\"))\nprint(\"make_default() ran\", len(CALLS), \"time(s), not once per call\")",
+   note: 'The default expression runs exactly once, when `def` executes. This is the mechanism behind the mutable-default trap, and it also catches `datetime.now()` defaults that freeze at import time.' },
+ { t: 'Arguments are passed by object reference',
+   code: "def rebind(xs):\n    xs = [99]            # rebinds the LOCAL name only\n    return xs\n\ndef mutate(xs):\n    xs.append(99)        # mutates the caller's object\n    return xs\n\na = [1]\nrebind(a)\nprint(\"after rebind:\", a)\n\nb = [1]\nmutate(b)\nprint(\"after mutate:\", b)",
+   note: 'Neither "by value" nor "by reference" describes Python: the function gets its own name bound to the caller’s object. Rebinding that name is invisible outside; mutating the object is not.' }
+],
+body: [
+ { h: 'Parameter order, which is enforced', html:
+   '<div class="pre code">def f(pos, /, normal, *args, kwonly, **kwargs):\n#     |        |       |       |        |\n#     |        |       |       |        +-- collects extra keywords\n#     |        |       |       +-- must be passed by name\n#     |        |       +-- collects extra positionals\n#     |        +-- positional or keyword\n#     +-- positional-only (rare)</div><p>Defaults must follow non-defaults. Getting the order wrong is a SyntaxError, so the compiler catches it — unlike almost everything else in this module.</p>' },
+ { h: 'When to use each', html:
+   '<table><thead><tr><th>Form</th><th>Use for</th></tr></thead><tbody><tr><td>Positional</td><td>The one or two obvious arguments</td></tr><tr><td>Keyword with a default</td><td>Optional behaviour</td></tr><tr><td><code>*args</code></td><td>Genuinely variable input — rare in pipeline code</td></tr><tr><td><code>*</code> (keyword-only)</td><td><b>Any boolean or mode flag</b></td></tr><tr><td><code>**kwargs</code></td><td>Passing options through a wrapper</td></tr></tbody></table><p><code>**kwargs</code> on a function you own is usually a design smell — it hides the real signature from the reader and from the type checker. On a decorator it is essential.</p>' },
+ { h: 'Mutable defaults, once more', html:
+   '<p>Because defaults evaluate once, <code>def f(x, acc=[])</code> shares one list across every call. Use <code>None</code> as the sentinel and build the real default inside the body. The same applies to <code>{}</code>, <code>set()</code>, and any function call in a default position.</p>' }
+],
+call: '"I make boolean and mode parameters keyword-only with a bare star, because write(rows, True, False) is unreadable at the call site and write(rows, mode=\'append\') is not. And defaults evaluate once at definition, which is why a mutable default is shared across every call."',
+warn: "Python is neither pass-by-value nor pass-by-reference: the function gets its own name bound to the caller's object. Rebinding that name is invisible to the caller; mutating the object is not — and the two look almost identical in the body.",
+qf: [
+ ['What does *args collect?', 'Extra positional arguments, as a tuple.'],
+ ['What does **kwargs collect?', 'Extra keyword arguments, as a dict.'],
+ ['What does a bare * in a signature do?', 'Makes every following parameter keyword-only.'],
+ ['When are defaults evaluated?', 'Once, when the def statement runs.'],
+ ['How are arguments passed?', "By object reference — the function gets its own name bound to the caller's object."],
+ ['What does f(**config) do?', 'Unpacks a dict into keyword arguments at the call site.'],
+ ['Why avoid **kwargs on your own functions?', 'It hides the real signature from readers and type checkers.']
+]});
+
+M.push({
+code: 'U3', track: 'Tier 3 · Functions',
+title: 'Lambdas, sorting and functions as values',
+sub: 'A function is an object. That single fact is what sorted(key=), map and decorators all rest on.',
+lede: 'Functions in Python are ordinary values: you can put one in a list, pass it as an argument, or return it. <code>lambda</code> is just a compact way to write a small one inline. The place this matters daily is sorting, where the <code>key</code> argument decides everything.',
+ex: [
+ { t: 'Sorting by a key, and by several',
+   code: "txns = [\n    {\"id\": \"t1\", \"wallet\": \"w-2\", \"amount\": 250.0},\n    {\"id\": \"t2\", \"wallet\": \"w-1\", \"amount\": 900.0},\n    {\"id\": \"t3\", \"wallet\": \"w-1\", \"amount\": 100.0},\n]\n\nby_amount = sorted(txns, key=lambda t: t[\"amount\"], reverse=True)\nprint(\"by amount:\", [t[\"id\"] for t in by_amount])\n\nby_wallet_then_amount = sorted(txns, key=lambda t: (t[\"wallet\"], -t[\"amount\"]))\nprint(\"wallet asc, amount desc:\", [(t[\"wallet\"], t[\"amount\"]) for t in by_wallet_then_amount])\n\nprint(\"original untouched:\", [t[\"id\"] for t in txns])",
+   note: 'A tuple key sorts by several fields; negating a number reverses just that one. `sorted` returns a new list and leaves the input alone — `list.sort()` mutates in place and returns None, which is a favourite trap.' },
+ { t: 'sort() returns None',
+   code: "xs = [3, 1, 2]\nresult = xs.sort()\nprint(\"xs after .sort():\", xs)\nprint(\"what .sort() returned:\", result)\n\nys = [3, 1, 2]\nprint(\"sorted(ys):\", sorted(ys), \" ys unchanged:\", ys)\n\n# the bug this causes:\ndata = [3, 1, 2]\ndata = data.sort()\nprint(\"data is now:\", data)",
+   note: 'Assigning the result of `.sort()` silently replaces your list with None. Every method that mutates in place returns None by convention — `append`, `extend`, `reverse`, `update` — which is deliberate, so that this mistake fails loudly on the next line.' },
+ { t: 'operator.itemgetter over a lambda',
+   code: "from operator import itemgetter\n\nrows = [(\"t3\", 100.0), (\"t1\", 900.0), (\"t2\", 250.0)]\n\nprint(\"by lambda:    \", sorted(rows, key=lambda r: r[1]))\nprint(\"by itemgetter:\", sorted(rows, key=itemgetter(1)))\n\ndicts = [{\"w\": \"w-2\", \"amt\": 5}, {\"w\": \"w-1\", \"amt\": 9}]\nprint(\"multi-key:\", sorted(dicts, key=itemgetter(\"w\", \"amt\")))",
+   note: 'itemgetter does the same job, is faster because it avoids a Python-level call per element, and reads better for multi-key sorts. Reach for a lambda when you need real logic, itemgetter when you are just pulling fields.' },
+ { t: 'Functions in data structures',
+   code: "def to_float(v):\n    return float(v)\n\ndef strip_text(v):\n    return v.strip()\n\nCLEANERS = {\n    \"amount\": to_float,\n    \"wallet\": strip_text,\n    \"note\":   lambda v: v.strip().lower(),\n}\n\nrow = {\"amount\": \"100\", \"wallet\": \"  w-1 \", \"note\": \"  URGENT  \"}\ncleaned = {k: CLEANERS[k](v) for k, v in row.items()}\nprint(cleaned)",
+   note: 'A dict of functions is a dispatch table, and it replaces a long if/elif chain with data you can extend without touching the logic. This is the shape of most column-cleaning code in a pipeline.' },
+ { t: 'map and filter are lazy; comprehensions are not',
+   code: "nums = [1, 2, 3, 4, 5]\n\ndoubled = map(lambda n: n * 2, nums)\nevens = filter(lambda n: n % 2 == 0, nums)\n\nprint(\"map object:\", type(doubled).__name__)\nprint(\"first pass: \", list(doubled))\nprint(\"second pass:\", list(doubled), \"<- exhausted\")\n\nprint(\"comprehension:\", [n * 2 for n in nums if n % 2 == 0])\nprint(\"filter total:\", sum(filter(lambda n: n % 2 == 0, nums)))",
+   note: '`map` and `filter` return lazy iterators, so they exhaust after one pass just like generators. For readability a comprehension usually wins; `map` earns its place when you already have a named function to apply.' }
+],
+body: [
+ { h: 'When a lambda is right, and when it is not', html:
+   '<table><thead><tr><th>Use a lambda</th><th>Use a def</th></tr></thead><tbody><tr><td>A sort key</td><td>Anything with a branch</td></tr><tr><td>A one-expression callback</td><td>Anything worth a name</td></tr><tr><td>A default in a dispatch table</td><td>Anything you want to test</td></tr></tbody></table><p>A lambda cannot contain a statement, so it cannot have a try block, an assignment or a loop. If you find yourself wanting one, you wanted a <code>def</code>.</p>' },
+ { h: 'Sorting facts worth knowing', html:
+   '<ul><li><strong>Python’s sort is stable</strong> — equal elements keep their original order, which is what lets you sort by one field then another and get a correct multi-key result.</li><li><strong><code>key</code> is called once per element</strong>, not once per comparison, so an expensive key function is affordable.</li><li><strong>Mixed types raise.</strong> Sorting a list containing both <code>None</code> and numbers fails — supply a key that normalises first.</li><li><strong><code>reverse=True</code> is not the same as reversing the key</strong> when the sort is stable and multi-key.</li></ul>' },
+ { h: 'The convention behind returning None', html:
+   '<p>Methods that mutate return <code>None</code> on purpose. It means <code>x = x.sort()</code> destroys your data immediately and visibly, rather than appearing to work. Once you know the rule, <code>sorted</code> versus <code>.sort()</code> and <code>reversed</code> versus <code>.reverse()</code> stop being arbitrary.</p>' }
+],
+call: '"A tuple key sorts by several fields at once and negating a number reverses just that one, which is cleaner than sorting twice. And I keep in mind that sort() mutates and returns None while sorted() returns a new list — assigning the result of sort() replaces your data with None."',
+warn: 'Assigning the result of `.sort()`, `.append()` or `.update()` gives you None. The convention is deliberate — mutating methods return None so the mistake fails immediately rather than silently producing an empty result later.',
+qf: [
+ ['What does sorted() return versus .sort()?', 'sorted() returns a new list; .sort() mutates in place and returns None.'],
+ ['How do you sort by two fields with opposite directions?', 'A tuple key, negating the numeric field you want descending.'],
+ ["Is Python's sort stable?", 'Yes — equal elements keep their relative order, which makes multi-pass sorting valid.'],
+ ['How often is the key function called?', 'Once per element, not once per comparison.'],
+ ['When is itemgetter better than a lambda?', 'When you are only pulling fields — it is faster and reads better for multi-key sorts.'],
+ ['What do map and filter return?', 'Lazy iterators that exhaust after one pass.'],
+ ['What can a lambda not contain?', 'Statements — no assignment, try, or loop. Use def instead.']
+]});
+
+M.push({
+code: 'U4', track: 'Tier 3 · Functions',
+title: 'Closures and late binding',
+sub: 'A function remembers where it was made — including the variable, not its value.',
+lede: 'A closure is a function that keeps a reference to the scope it was defined in. That is what makes factories, decorators and callbacks work. It is also the source of the most-asked Python puzzle, because the closure captures the <em class="hl">variable</em>, not the value it had at definition time.',
+ex: [
+ { t: 'A closure captures its enclosing scope',
+   code: "def make_multiplier(factor):\n    def multiply(n):\n        return n * factor      # factor comes from the enclosing scope\n    return multiply\n\ndouble = make_multiplier(2)\ntriple = make_multiplier(3)\n\nprint(double(10), triple(10))\nprint(\"independent:\", double(1), triple(1))",
+   note: 'Each call to the factory creates a new scope, so `double` and `triple` hold different `factor` values. The inner function outlives the call that created it and keeps its scope alive.' },
+ { t: 'The late-binding trap',
+   code: "funcs = []\nfor i in range(3):\n    funcs.append(lambda: i)\n\nprint(\"expected [0, 1, 2], got:\", [f() for f in funcs])\nprint(\"because all three close over the SAME variable i, now\", i)",
+   note: 'All three lambdas reference the same `i`, and by the time they run the loop has finished. This is not a bug in closures — it is what capturing a variable rather than a value means, and it is asked in interviews constantly.' },
+ { t: 'Two fixes, and why the first is preferred',
+   code: "funcs_default = []\nfor i in range(3):\n    funcs_default.append(lambda i=i: i)      # bind now, via a default\n\ndef make(i):\n    return lambda: i                          # fresh scope per call\n\nfuncs_factory = [make(i) for i in range(3)]\n\nprint(\"default-argument fix:\", [f() for f in funcs_default])\nprint(\"factory fix:         \", [f() for f in funcs_factory])",
+   note: 'The default-argument fix works because defaults evaluate at definition time — the same mechanism that causes the mutable-default trap, used deliberately. The factory version is clearer when the closure is more than one line.' },
+ { t: 'A closure holding real state',
+   code: "def make_batcher(size):\n    batch = []\n    def add(row):\n        nonlocal batch\n        batch.append(row)\n        if len(batch) >= size:\n            full, batch = batch, []\n            return full\n        return None\n    return add\n\nadd = make_batcher(3)\nfor n in range(7):\n    out = add(n)\n    if out:\n        print(\"emitted batch:\", out)\nprint(\"held back (not yet full):\", add(\"flush-marker\") is None)",
+   note: 'A closure is a lightweight alternative to a class when you need one piece of state and one operation. `nonlocal` is what lets `add` rebind `batch` rather than shadowing it.' },
+ { t: 'Closures are why decorators work',
+   code: "def counted(fn):\n    calls = 0\n    def wrapper(*args):\n        nonlocal calls\n        calls += 1\n        wrapper.calls = calls\n        return fn(*args)\n    wrapper.calls = 0\n    return wrapper\n\n@counted\ndef parse(x):\n    return int(x)\n\nparse(\"1\"); parse(\"2\"); parse(\"3\")\nprint(\"parse called\", parse.calls, \"times\")",
+   note: 'The wrapper closes over both `fn` and `calls`. Every decorator in the next module is this shape — which is why closures come first.' }
+],
+body: [
+ { h: 'What a closure captures', html:
+   '<div class="pre">def outer():\n    x = 1\n    def inner():\n        return x     <i>captures the VARIABLE x, not the value 1</i>\n    x = 99\n    return inner\n\nouter()()  ->  99, not 1</div><p>The inner function looks up <code>x</code> when it runs, not when it is defined. Everything about late binding follows from that.</p>' },
+ { h: 'Where late binding actually bites', html:
+   '<ul><li><strong>Building callbacks in a loop</strong> — event handlers, retry functions, per-column cleaners.</li><li><strong>Building a dispatch table in a loop</strong> — every entry ends up pointing at the last value.</li><li><strong>Deferred logging</strong> — a lambda capturing a loop variable logs the final one.</li></ul><p>It does not bite in a list comprehension that calls the function immediately, which is why the bug only appears when the functions are stored and run later.</p>' },
+ { h: 'Closure or class?', html:
+   '<table><thead><tr><th>Closure</th><th>Class</th></tr></thead><tbody><tr><td>One piece of state</td><td>Several related fields</td></tr><tr><td>One operation</td><td>Several methods</td></tr><tr><td>No need to inspect state</td><td>You want a repr, equality, or tests on state</td></tr></tbody></table>' }
+],
+call: '"A closure captures the variable rather than its value, which is why lambdas built in a loop all return the final one — they look it up when they run, not when they were defined. The default-argument fix binds at definition time, using the same mechanism that causes the mutable-default trap, deliberately."',
+warn: "Building functions in a loop and storing them for later gives every one of them the loop variable's final value. The code reads correctly, and it only misbehaves once the functions are called after the loop ends.",
+qf: [
+ ['What is a closure?', 'A function that keeps a reference to the scope it was defined in.'],
+ ['What does a closure capture — value or variable?', 'The variable. It is looked up when the function runs, not when it is defined.'],
+ ['Why do lambdas in a loop all return the last value?', 'They share one loop variable, and by the time they run the loop has finished.'],
+ ['Name two fixes for late binding.', 'A default argument that binds at definition time, or a factory function giving each a fresh scope.'],
+ ['What does nonlocal do in a closure?', 'Lets the inner function rebind the enclosing variable rather than shadowing it.'],
+ ['When is a closure better than a class?', 'One piece of state and one operation, with no need to inspect it.']
+]});
+
+M.push({
+code: 'U5', track: 'Tier 3 · Functions',
+title: 'Decorators, built up from nothing',
+sub: 'A function that takes a function and returns a function. Everything else is detail.',
+lede: 'Decorators look like syntax and are not — <code>@deco</code> above a definition is exactly <code>f = deco(f)</code>. Once that lands, retry, caching, timing, logging and validation all stop being magic and become the same four-line shape you can write from memory.',
+ex: [
+ { t: 'Build one from first principles',
+   code: "def announce(fn):\n    def wrapper(*args, **kwargs):\n        print(f\"  calling {fn.__name__} with {args}\")\n        result = fn(*args, **kwargs)\n        print(f\"  {fn.__name__} returned {result}\")\n        return result\n    return wrapper\n\ndef add(a, b):\n    return a + b\n\nadd = announce(add)          # this line IS the @ syntax\nprint(\"result:\", add(2, 3))",
+   note: 'No decorator syntax used at all. `announce` receives the function, builds a replacement that calls it, and returns the replacement. The `@` form on the next example is identical.' },
+ { t: 'The same thing with @',
+   code: "def announce(fn):\n    def wrapper(*args, **kwargs):\n        print(f\"  calling {fn.__name__}\")\n        return fn(*args, **kwargs)\n    return wrapper\n\n@announce\ndef parse(raw):\n    return float(raw)\n\nprint(\"result:\", parse(\"12.5\"))\nprint(\"what parse actually is now:\", parse.__name__)",
+   note: 'Note the last line: the name is now `wrapper`, not `parse`. The decorator replaced the function and the identity went with it — which breaks tracebacks, documentation and anything that introspects. That is what functools.wraps fixes.' },
+ { t: 'functools.wraps preserves identity',
+   code: "from functools import wraps\n\ndef announce(fn):\n    @wraps(fn)\n    def wrapper(*args, **kwargs):\n        return fn(*args, **kwargs)\n    return wrapper\n\n@announce\ndef parse(raw):\n    return float(raw)\n\nprint(\"name preserved:\", parse.__name__)\nprint(\"still works:\", parse(\"7\"))",
+   note: 'One line, and the wrapped function keeps its name. Always use it — without it, a stack trace from inside a decorated function names `wrapper` and tells you nothing about which function failed.' },
+ { t: 'A decorator that takes arguments needs three levels',
+   code: "def retry(attempts):\n    def decorate(fn):\n        def wrapper(*args):\n            for attempt in range(1, attempts + 1):\n                try:\n                    return fn(*args)\n                except ValueError as e:\n                    print(f\"  attempt {attempt} failed: {e}\")\n                    if attempt == attempts:\n                        raise\n        return wrapper\n    return decorate\n\nstate = {\"n\": 0}\n\n@retry(attempts=3)\ndef flaky():\n    state[\"n\"] += 1\n    if state[\"n\"] < 3:\n        raise ValueError(\"transient\")\n    return \"ok\"\n\nprint(\"result:\", flaky(), \"after\", state[\"n\"], \"attempts\")",
+   note: 'Three nested functions: `retry(3)` returns `decorate`, which receives the function and returns `wrapper`. The extra level exists purely to capture the argument — which is a closure, from the previous module.' },
+ { t: 'Caching, and measuring that it worked',
+   code: "from functools import lru_cache\n\ncalls = {\"n\": 0}\n\n@lru_cache\ndef slow_lookup(key):\n    calls[\"n\"] += 1\n    return key.upper()\n\nfor k in [\"a\", \"b\", \"a\", \"a\", \"b\"]:\n    slow_lookup(k)\n\nprint(\"lookups requested: 5\")\nprint(\"actual calls made:\", calls[\"n\"])\nprint(\"cache saved\", 5 - calls[\"n\"], \"calls\")",
+   note: 'The cache is keyed on the arguments, so repeats never reach the function. This only works if arguments are hashable and the function is pure — caching something that reads a changing source hands you stale data with no warning.' },
+ { t: 'Stacking decorators applies bottom-up',
+   code: "def tag(name):\n    def decorate(fn):\n        def wrapper(*a):\n            return f\"<{name}>{fn(*a)}</{name}>\"\n        return wrapper\n    return decorate\n\n@tag(\"outer\")\n@tag(\"inner\")\ndef content():\n    return \"text\"\n\nprint(content())\nprint(\"bottom decorator is applied first, so it ends up innermost\")",
+   note: 'Read decorators bottom-up: `inner` wraps the function, then `outer` wraps that. It matters when order changes behaviour — caching above retry caches the failures, caching below retry caches only successes.' }
+],
+body: [
+ { h: 'The three shapes', html:
+   '<div class="pre code">def deco(fn):                    <i>no arguments</i>\n    def wrapper(*a, **kw):\n        return fn(*a, **kw)\n    return wrapper\n\ndef deco(arg):                   <i>takes arguments — one extra level</i>\n    def decorate(fn):\n        def wrapper(*a, **kw):\n            return fn(*a, **kw)\n        return wrapper\n    return decorate\n\nclass Deco:                      <i>class-based, for stateful decorators</i>\n    def __init__(self, fn): self.fn = fn\n    def __call__(self, *a): return self.fn(*a)</div>' },
+ { h: 'What decorators are actually for', html:
+   '<table><thead><tr><th>Concern</th><th>Why a decorator</th></tr></thead><tbody><tr><td>Retry with backoff</td><td>Needed on many functions, identical each time</td></tr><tr><td>Caching</td><td>Orthogonal to what the function computes</td></tr><tr><td>Timing and logging</td><td>Cross-cutting; you want it off in one place</td></tr><tr><td>Input validation</td><td>Same check on every entry point</td></tr><tr><td>Registration</td><td>Building a dispatch table at import time</td></tr></tbody></table><p>The test is whether the behaviour is <em class="hl">orthogonal</em> to the function’s purpose. Business logic in a decorator hides it from anyone reading the function.</p>' },
+ { h: 'The two rules', html:
+   '<ul><li><strong>Always use <code>functools.wraps</code></strong>, or tracebacks and introspection break.</li><li><strong>Read stacked decorators bottom-up.</strong> The one closest to <code>def</code> is applied first and sits innermost.</li></ul>' }
+],
+call: '"A decorator is a function that takes a function and returns a replacement — the @ is just f = deco(f). One that takes arguments needs a third level purely to capture them. And I always use functools.wraps, because without it a traceback from inside a decorated function names \'wrapper\' and tells you nothing."',
+warn: 'Caching above retry caches the failures too, so a transient error becomes permanent for every later caller. Stacking order changes behaviour, and decorators apply bottom-up — the one nearest `def` runs first.',
+qf: [
+ ['What is a decorator, mechanically?', 'A function that takes a function and returns a replacement.'],
+ ['What is @deco shorthand for?', 'f = deco(f).'],
+ ['Why does a parameterised decorator need three levels?', 'The outer level captures the argument, the middle receives the function, the inner is the wrapper.'],
+ ['What does functools.wraps do?', "Preserves the wrapped function's name and metadata so tracebacks and introspection still work."],
+ ['In what order do stacked decorators apply?', 'Bottom-up — the one nearest def is applied first and ends up innermost.'],
+ ['When is caching unsafe?', 'When the function is not pure — caching a changing source returns stale data silently.'],
+ ['What belongs in a decorator?', "Behaviour orthogonal to the function's purpose — retry, caching, timing, validation, registration."]
+]});
+
+M.push({
+code: 'U6', track: 'Tier 3 · Functions',
+title: 'Type hints and what they do not do',
+sub: 'Documentation the tooling can check. Not enforcement — Python ignores them at runtime.',
+lede: 'Annotations describe intent and are checked by <code>mypy</code>, your editor and code review — never by the interpreter. Believing otherwise leads to a function annotated <code>-> float</code> that cheerfully returns a string. Used honestly they are the cheapest documentation available, because they cannot go stale silently.',
+ex: [
+ { t: 'Annotations are not enforced',
+   code: "def parse_amount(raw: str) -> float:\n    return raw            # returns a str, not a float — no error at runtime\n\nresult = parse_amount(\"100\")\nprint(\"returned:\", result, \"of type\", type(result).__name__)\nprint(\"annotation says float; Python did not check\")\n\ndef add(a: int, b: int) -> int:\n    return a + b\n\nprint(add(\"x\", \"y\"), \"<- also fine at runtime\")",
+   note: 'Both functions violate their annotations and run happily. Python stores annotations and ignores them. A type checker catches both of these before the code ever runs, which is the entire value proposition.' },
+ { t: 'Where they earn their place',
+   code: "def summarise(rows: list, key: str) -> dict:\n    totals: dict = {}\n    for r in rows:\n        totals[r[key]] = totals.get(r[key], 0) + r[\"amount\"]\n    return totals\n\nrows = [{\"wallet\": \"w-1\", \"amount\": 100}, {\"wallet\": \"w-1\", \"amount\": 50}]\nprint(summarise(rows, \"wallet\"))\n\n# without the annotation the reader must infer the shape from the body;\n# with it, the contract is on the first line",
+   note: 'The signature is where a reader looks first. Annotating the boundary functions of a module — what goes in, what comes out — gives most of the benefit for very little typing.' },
+ { t: 'Optional, and the None that hides in every pipeline',
+   code: "def find_wallet(rows, wallet_id):\n    for r in rows:\n        if r[\"wallet\"] == wallet_id:\n            return r\n    return None                      # the case people forget\n\nrows = [{\"wallet\": \"w-1\", \"amount\": 100}]\n\nhit = find_wallet(rows, \"w-1\")\nprint(\"found:\", hit)\n\nmiss = find_wallet(rows, \"w-9\")\nprint(\"missing:\", miss)\ntry:\n    print(miss[\"amount\"])\nexcept TypeError as e:\n    print(\"and this is the crash:\", e)",
+   note: 'A function that returns `X | None` is the single most common source of runtime crashes in a pipeline. Annotating it `Optional[dict]` makes the checker force every caller to handle the None branch — which is the whole point.' },
+ { t: 'Runtime validation is a separate job',
+   code: "def load(rows, mode=\"append\"):\n    if not isinstance(rows, list):\n        raise TypeError(f\"rows must be a list, got {type(rows).__name__}\")\n    if mode not in {\"append\", \"overwrite\"}:\n        raise ValueError(f\"unknown mode: {mode!r}\")\n    return f\"{len(rows)} rows, mode={mode}\"\n\nprint(load([1, 2]))\ntry:\n    load(\"not a list\")\nexcept TypeError as e:\n    print(\"caught:\", e)\ntry:\n    load([1], mode=\"upsert\")\nexcept ValueError as e:\n    print(\"caught:\", e)",
+   note: 'If a value comes from outside your code — a config file, an API, a CLI argument — annotations will not save you. Validate at the boundary and let annotations document the interior.' }
+],
+body: [
+ { h: 'The common annotations', html:
+   '<div class="pre code">def f(x: int, name: str = "", rows: list[dict] | None = None) -> float: ...\n\nlist[dict]        <i>a list of dicts (Python 3.9+)</i>\ndict[str, float]  <i>keys and values</i>\nX | None          <i>optional (3.10+); Optional[X] before that</i>\nCallable[..., X]  <i>a function returning X</i>\nIterator[dict]    <i>a generator of dicts</i>\nAny               <u>an escape hatch — use sparingly</u></div>' },
+ { h: 'What they buy, honestly', html:
+   '<table><thead><tr><th>Real benefit</th><th>Not a benefit</th></tr></thead><tbody><tr><td>Editor autocomplete and navigation</td><td>Runtime safety</td></tr><tr><td>mypy catches mismatches before running</td><td>Performance</td></tr><tr><td>Documentation that cannot silently rot</td><td>Input validation</td></tr><tr><td>Forces callers to handle <code>None</code></td><td>Protection from bad external data</td></tr></tbody></table>' },
+ { h: 'Where to spend the effort', html:
+   '<ul><li><strong>Annotate public functions</strong> — the boundary of a module.</li><li><strong>Always annotate anything returning <code>X | None</code></strong>; that is where the crashes come from.</li><li><strong>Skip obvious locals.</strong> <code>count: int = 0</code> adds nothing.</li><li><strong>Run mypy in CI</strong>, or the annotations are decoration.</li><li><strong>Validate external input separately</strong> — annotations are for your code, not the world’s data.</li></ul>' }
+],
+call: '"Annotations are documentation the tooling can check, not enforcement — Python ignores them at runtime, so a function annotated to return float can return a string. I annotate module boundaries and anything that can return None, and I validate external input separately, because a type hint will not stop a malformed API response."',
+warn: 'A type hint provides no runtime protection whatsoever. Data arriving from a file, an API or a config is unvalidated regardless of how carefully the function is annotated — and the crash happens deep inside, not at the boundary.',
+qf: [
+ ['Does Python enforce type hints?', 'No — it stores and ignores them. Only a checker like mypy uses them.'],
+ ['What is the main practical benefit?', 'Catching mismatches before running, plus editor support and documentation that cannot rot silently.'],
+ ['Which annotation matters most in a pipeline?', 'X | None (Optional) — it forces callers to handle the missing case.'],
+ ['Do hints validate external input?', 'No. Validate at the boundary with explicit checks.'],
+ ['Where should you spend annotation effort?', 'Public functions and module boundaries, not obvious locals.'],
+ ['What makes annotations worthwhile?', 'Running a type checker in CI — otherwise they are decoration.']
+]});
+
+M.push({
+code: 'O1', track: 'Tier 4 · Objects',
+title: 'Classes, __init__ and where state lives',
+sub: 'Instance attributes belong to the object. Class attributes are shared by every instance.',
+lede: 'A class is a template for objects that carry state and behaviour together. The distinction that causes real bugs is <em class="hl">where</em> an attribute lives: set on <code>self</code> it belongs to one instance; set in the class body it is shared by all of them — which is the mutable-default trap wearing different clothes.',
+ex: [
+ { t: 'Instance state, set in __init__',
+   code: "class Transaction:\n    def __init__(self, txn_id, amount, wallet):\n        self.txn_id = txn_id\n        self.amount = amount\n        self.wallet = wallet\n        self.flags = []                # a NEW list per instance\n\n    def flag(self, reason):\n        self.flags.append(reason)\n        return self\n\na = Transaction(\"t1\", 9800.0, \"w-2\")\nb = Transaction(\"t2\", 40.0, \"w-1\")\na.flag(\"near-threshold\")\n\nprint(\"a.flags:\", a.flags)\nprint(\"b.flags:\", b.flags, \"<- independent\")\nprint(\"a.__dict__:\", a.__dict__)",
+   note: 'Each instance gets its own `flags` because the list is created inside `__init__`, which runs per object. `__dict__` shows exactly what this instance carries — useful when debugging why two objects behave differently.' },
+ { t: 'Class attributes are shared — and mutable ones are a trap',
+   code: "class Broken:\n    flags = []                         # ONE list, shared by every instance\n\n    def __init__(self, txn_id):\n        self.txn_id = txn_id\n\na = Broken(\"t1\")\nb = Broken(\"t2\")\na.flags.append(\"suspicious\")\n\nprint(\"a.flags:\", a.flags)\nprint(\"b.flags:\", b.flags, \"<- same list!\")\nprint(\"shared with the class:\", Broken.flags)",
+   note: 'Exactly the mutable-default bug from Tier 2, in class form. A mutable class attribute is shared state that looks like per-object state, and it accumulates for the life of the process.' },
+ { t: 'When a class attribute is right',
+   code: "class Loader:\n    VALID_MODES = (\"append\", \"overwrite\", \"merge\")     # immutable, shared: correct\n    instances_created = 0                               # deliberate shared counter\n\n    def __init__(self, mode):\n        if mode not in Loader.VALID_MODES:\n            raise ValueError(f\"unknown mode: {mode!r}\")\n        self.mode = mode\n        Loader.instances_created += 1\n\nLoader(\"append\")\nLoader(\"merge\")\nprint(\"created:\", Loader.instances_created)\ntry:\n    Loader(\"upsert\")\nexcept ValueError as e:\n    print(\"rejected:\", e)",
+   note: 'Constants and deliberate counters are exactly what class attributes are for. The tuple is immutable so sharing is safe, and the counter is shared on purpose — note it is incremented on `Loader`, not on `self`.' },
+ { t: 'Assigning through self creates an instance attribute',
+   code: "class Config:\n    retries = 3                        # class-level default\n\na = Config()\nb = Config()\n\nprint(\"both see the default:\", a.retries, b.retries)\n\na.retries = 10                          # creates an INSTANCE attribute on a\nprint(\"a overrode it:\", a.retries, \" b still default:\", b.retries)\nprint(\"class unchanged:\", Config.retries)\n\nConfig.retries = 5                      # changing the class\nprint(\"a keeps its own:\", a.retries, \" b follows the class:\", b.retries)",
+   note: 'Assignment through `self` never modifies the class — it shadows. This is why the immutable class-attribute-as-default pattern works safely, and why the mutable version does not: `append` mutates the shared object rather than shadowing it.' }
+],
+body: [
+ { h: 'Where attributes live', html:
+   '<table><thead><tr><th></th><th>Instance attribute</th><th>Class attribute</th></tr></thead><tbody><tr><td>Set in</td><td><code>__init__</code>, via <code>self.x = ...</code></td><td>The class body</td></tr><tr><td>Belongs to</td><td>One object</td><td>Every instance</td></tr><tr><td>Right for</td><td>Per-object state</td><td>Constants, defaults, counters</td></tr><tr><td>Mutable version</td><td>Fine</td><td><b>Shared-state bug</b></td></tr></tbody></table>' },
+ { h: 'Lookup order', html:
+   '<p>Reading <code>obj.x</code> checks the instance first, then the class, then its bases. Writing <code>obj.x = ...</code> always writes to the instance. That asymmetry is the whole model, and it explains every behaviour in this module.</p>' },
+ { h: 'The rule', html:
+   '<p>Any mutable class attribute — <code>[]</code>, <code>{}</code>, <code>set()</code> — should be created in <code>__init__</code> instead. Immutable ones are safe and idiomatic.</p>' }
+],
+call: '"Instance attributes are created per object in __init__; class attributes are shared by every instance. A mutable class attribute is the same bug as a mutable default argument — shared state that looks like per-object state — so anything mutable belongs in __init__."',
+warn: 'A mutable class attribute looks like a per-instance default and is one shared object. Every instance appends to the same list, and in a long-running process it grows until the memory does.',
+qf: [
+ ['Where do instance attributes live?', 'On the object, created by self.x = ... in __init__.'],
+ ['What is wrong with a mutable class attribute?', 'It is shared by every instance — the same bug as a mutable default argument.'],
+ ['When is a class attribute right?', 'Immutable constants, defaults, and deliberate shared counters.'],
+ ['What does self.x = 1 do if x is a class attribute?', 'Creates an instance attribute that shadows it; the class is unchanged.'],
+ ['What is the attribute lookup order?', 'Instance, then class, then base classes.'],
+ ['What does obj.__dict__ show?', 'The instance attributes only, not class-level ones.']
+]});
+
+M.push({
+code: 'O2', track: 'Tier 4 · Objects',
+title: 'Methods, self, and the three method types',
+sub: 'self is just the first argument. staticmethod and classmethod change what gets passed.',
+lede: 'A method is a function stored on a class. When you call it through an instance, Python passes the instance as the first argument — that is all <code>self</code> means. <code>@staticmethod</code> and <code>@classmethod</code> change what that first argument is, or remove it.',
+ex: [
+ { t: 'self is passed explicitly by the interpreter',
+   code: "class Wallet:\n    def __init__(self, wid):\n        self.wid = wid\n\n    def describe(self):\n        return f\"wallet {self.wid}\"\n\nw = Wallet(\"w-1\")\n\nprint(\"normal call:\", w.describe())\nprint(\"same thing:  \", Wallet.describe(w))\nprint(\"bound method:\", w.describe)",
+   note: '`w.describe()` and `Wallet.describe(w)` are the same call. A bound method is just the function with the instance already attached — which is why forgetting `self` in a definition produces an argument-count error rather than something mysterious.' },
+ { t: 'classmethod as an alternative constructor',
+   code: "class Transaction:\n    def __init__(self, txn_id, amount):\n        self.txn_id = txn_id\n        self.amount = amount\n\n    @classmethod\n    def from_row(cls, row):\n        return cls(row[\"id\"], float(row[\"amount\"]))\n\n    @classmethod\n    def from_csv_line(cls, line):\n        parts = line.split(\",\")\n        return cls(parts[0], float(parts[1]))\n\n    def __repr__(self):\n        return f\"Transaction({self.txn_id!r}, {self.amount})\"\n\nprint(Transaction.from_row({\"id\": \"t1\", \"amount\": \"100\"}))\nprint(Transaction.from_csv_line(\"t2,250.5\"))",
+   note: 'This is the main real use of `classmethod`: named constructors for different input shapes. Because it receives `cls` rather than a hardcoded name, a subclass calling `from_row` gets an instance of the subclass.' },
+ { t: 'staticmethod for a related function with no state',
+   code: "class AmountParser:\n    THRESHOLD = 9000.0\n\n    @staticmethod\n    def clean(raw):\n        return float(str(raw).replace(\",\", \"\").strip())\n\n    @classmethod\n    def is_near_threshold(cls, raw):\n        return cls.clean(raw) >= cls.THRESHOLD\n\nprint(AmountParser.clean(\" 1,250.50 \"))\nprint(AmountParser.is_near_threshold(\"9,800\"))\nprint(AmountParser.is_near_threshold(\"100\"))",
+   note: '`clean` needs neither the instance nor the class, so it takes neither. Grouping it on the class is organisational — and honestly, a module-level function would often be just as good.' },
+ { t: 'Forgetting self, and what the error looks like',
+   code: "class Broken:\n    def method():                      # no self\n        return \"hi\"\n\nb = Broken()\ntry:\n    b.method()\nexcept TypeError as e:\n    print(\"calling through the instance:\", e)\n\nprint(\"but through the class it works:\", Broken.method())",
+   note: 'The instance is still passed, so a zero-parameter method receives one argument and fails. Reading the error as "one too many" rather than "something broke" makes it obvious immediately.' }
+],
+body: [
+ { h: 'The three method types', html:
+   '<table><thead><tr><th></th><th>Receives</th><th>Use for</th></tr></thead><tbody><tr><td>Instance method</td><td><code>self</code></td><td>Anything using instance state</td></tr><tr><td><code>@classmethod</code></td><td><code>cls</code></td><td><b>Alternative constructors</b>, class-level state</td></tr><tr><td><code>@staticmethod</code></td><td>Nothing</td><td>A related helper needing no state</td></tr></tbody></table>' },
+ { h: 'Why classmethod beats hardcoding the class', html:
+   '<div class="pre code">@classmethod\ndef from_row(cls, row):\n    return cls(row["id"])       <i>a subclass gets a subclass instance</i>\n\n@staticmethod\ndef from_row(row):\n    return Transaction(row["id"])  <u>a subclass still gets a Transaction</u></div>' },
+ { h: 'When not to use a class at all', html:
+   '<p>If a class has one method and no state, it is a function. If it has only static methods, it is a module. Python does not require you to wrap things in classes — reaching for one where a function would do is a common way to make code harder to test.</p>' }
+],
+call: '"self is just the first argument — w.describe() and Wallet.describe(w) are the same call. I use classmethod for alternative constructors because it receives cls, so a subclass gets an instance of itself rather than the parent. And a class with only static methods is really a module."',
+warn: 'Forgetting `self` gives a confusing argument-count error, because the instance is still passed. The method appears to take zero arguments and receives one — reading it as "one too many" makes the cause obvious.',
+qf: [
+ ['What is self?', 'The first argument, which Python passes automatically when calling through an instance.'],
+ ['Are w.f() and Cls.f(w) the same?', 'Yes — a bound method is the function with the instance already attached.'],
+ ['What does a classmethod receive?', 'cls, the class it was called on — including a subclass.'],
+ ['What is the main use of classmethod?', 'Alternative constructors that work correctly for subclasses.'],
+ ['What does a staticmethod receive?', 'Nothing — it is a plain function grouped on the class.'],
+ ['When should you not write a class?', 'When there is one method and no state, or only static methods.']
+]});
+
+M.push({
+code: 'O3', track: 'Tier 4 · Objects',
+title: 'Dunder methods',
+sub: 'How your objects hook into len(), ==, in, iteration, printing and with.',
+lede: 'Python’s built-in operations are protocols: <code>len(x)</code> calls <code>x.__len__()</code>, <code>a == b</code> calls <code>a.__eq__(b)</code>, <code>for x in y</code> calls <code>y.__iter__()</code>. Implementing the right dunders makes your objects work with the language instead of alongside it.',
+ex: [
+ { t: '__repr__ and __str__ are for different audiences',
+   code: "class Txn:\n    def __init__(self, tid, amount):\n        self.tid = tid\n        self.amount = amount\n\n    def __repr__(self):\n        return f\"Txn(tid={self.tid!r}, amount={self.amount})\"\n\n    def __str__(self):\n        return f\"{self.tid}: {self.amount:,.2f}\"\n\nt = Txn(\"t1\", 9800.0)\nprint(\"str  (for humans):\", str(t))\nprint(\"repr (for you):   \", repr(t))\nprint(\"inside a list:\", [t])",
+   note: '`__repr__` is for developers and should be unambiguous — ideally something you could paste back into code. `__str__` is for display. Containers always use `__repr__`, which is why a list of objects with only `__str__` prints uselessly.' },
+ { t: '__eq__ and the hashability rule',
+   code: "class Key:\n    def __init__(self, wallet, dt):\n        self.wallet = wallet\n        self.dt = dt\n\n    def __eq__(self, other):\n        return (self.wallet, self.dt) == (other.wallet, other.dt)\n\n    def __hash__(self):\n        return hash((self.wallet, self.dt))\n\n    def __repr__(self):\n        return f\"Key({self.wallet}, {self.dt})\"\n\na = Key(\"w-1\", \"2026-02-01\")\nb = Key(\"w-1\", \"2026-02-01\")\n\nprint(\"equal:\", a == b, \" same object:\", a is b)\nprint(\"dedupes in a set:\", len({a, b}))\nprint(\"works as a dict key:\", {a: 1}[b])",
+   note: 'Defining `__eq__` without `__hash__` makes the object unhashable — Python assumes that if you customised equality, the default hash is wrong. Two objects that compare equal must hash equal, or sets and dicts break silently.' },
+ { t: 'Container protocols: len, getitem, contains, iter',
+   code: "class Batch:\n    def __init__(self, rows):\n        self._rows = rows\n\n    def __len__(self):\n        return len(self._rows)\n\n    def __getitem__(self, i):\n        return self._rows[i]\n\n    def __contains__(self, tid):\n        return any(r[\"id\"] == tid for r in self._rows)\n\n    def __iter__(self):\n        return iter(self._rows)\n\nb = Batch([{\"id\": \"t1\"}, {\"id\": \"t2\"}, {\"id\": \"t3\"}])\n\nprint(\"len:\", len(b))\nprint(\"index:\", b[0])\nprint(\"in:\", \"t2\" in b, \"t9\" in b)\nprint(\"iterate:\", [r[\"id\"] for r in b])\nprint(\"truthy:\", bool(b), \" empty is falsy:\", bool(Batch([])))",
+   note: 'Four dunders and the object behaves like a built-in container. Note the last line: `bool()` falls back to `__len__` when `__bool__` is absent, so an empty batch is correctly falsy without extra work.' },
+ { t: 'Arithmetic and ordering',
+   code: "class Money:\n    def __init__(self, amount):\n        self.amount = amount\n\n    def __add__(self, other):\n        return Money(self.amount + other.amount)\n\n    def __lt__(self, other):\n        return self.amount < other.amount\n\n    def __eq__(self, other):\n        return self.amount == other.amount\n\n    def __repr__(self):\n        return f\"Money({self.amount})\"\n\na, b = Money(100), Money(250)\nprint(\"add:\", a + b)\nprint(\"compare:\", a < b, a > b)\nprint(\"sorted:\", sorted([b, a]))\nprint(\"min:\", min(a, b))",
+   note: '`__lt__` alone is enough for `sorted`, `min` and `max`, because they only need "less than". Python derives `>` by swapping the operands, so you rarely need to implement all six comparisons.' },
+ { t: '__enter__ and __exit__ make it usable with `with`',
+   code: "class Timer:\n    def __init__(self, label):\n        self.label = label\n        self.steps = 0\n\n    def __enter__(self):\n        print(f\"  start {self.label}\")\n        return self\n\n    def __exit__(self, exc_type, exc, tb):\n        print(f\"  end {self.label} after {self.steps} steps\")\n        return False\n\nwith Timer(\"load\") as t:\n    for _ in range(3):\n        t.steps += 1\n\ntry:\n    with Timer(\"failing load\") as t:\n        raise ValueError(\"boom\")\nexcept ValueError as e:\n    print(\"propagated:\", e)",
+   note: '`__exit__` runs on both paths, and returning False lets the exception propagate. Returning True would swallow it — the context-manager equivalent of `except: pass`.' }
+],
+body: [
+ { h: 'The dunders worth knowing', html:
+   '<table><thead><tr><th>Dunder</th><th>Powers</th></tr></thead><tbody><tr><td><code>__init__</code></td><td>Construction</td></tr><tr><td><code>__repr__</code> / <code>__str__</code></td><td>Debugging / display</td></tr><tr><td><code>__eq__</code> + <code>__hash__</code></td><td>Equality, sets, dict keys</td></tr><tr><td><code>__len__</code></td><td><code>len()</code>, and truthiness</td></tr><tr><td><code>__getitem__</code></td><td>Indexing and slicing</td></tr><tr><td><code>__contains__</code></td><td><code>in</code></td></tr><tr><td><code>__iter__</code></td><td><code>for</code>, unpacking, <code>list()</code></td></tr><tr><td><code>__lt__</code></td><td><code>sorted</code>, <code>min</code>, <code>max</code></td></tr><tr><td><code>__enter__</code> / <code>__exit__</code></td><td><code>with</code></td></tr><tr><td><code>__call__</code></td><td>Making an instance callable</td></tr></tbody></table>' },
+ { h: 'The equality and hashing contract', html:
+   '<ul><li>If <code>a == b</code> then <code>hash(a) == hash(b)</code>. The reverse need not hold.</li><li>Defining <code>__eq__</code> sets <code>__hash__</code> to None unless you define it too.</li><li>Hash on the same fields you compare on, as a tuple.</li><li>Never hash on a mutable field — the object would move buckets and become unfindable.</li></ul>' },
+ { h: 'Do not overdo it', html:
+   '<p>Implement the dunders that make your object work naturally with Python. Overloading arithmetic on a domain object that is not a number makes code cryptic — <code>report + report</code> means nothing to a reader.</p>' }
+],
+call: '"Dunders are how objects hook into the language — len, in, iteration and sorting are all protocols. The contract that catches people is that defining __eq__ without __hash__ makes the object unhashable, because Python assumes the default hash no longer matches your equality."',
+warn: 'Defining `__eq__` silently removes hashability. The class works fine until someone puts it in a set or uses it as a dict key, and then fails with an unhashable-type error far from the class definition.',
+qf: [
+ ['What is the difference between __repr__ and __str__?', '__repr__ is unambiguous, for developers; __str__ is for display. Containers use __repr__.'],
+ ['What happens if you define __eq__ without __hash__?', 'The object becomes unhashable and cannot go in a set or be a dict key.'],
+ ['What is the hashing contract?', 'Equal objects must hash equal — hash on the same fields you compare on.'],
+ ['Which dunder makes `in` work?', '__contains__, falling back to __iter__ if absent.'],
+ ['How many comparison dunders do you need for sorting?', 'Just __lt__ — Python derives the rest by swapping operands.'],
+ ['What determines truthiness without __bool__?', '__len__ — zero length is falsy.'],
+ ['What does returning True from __exit__ do?', 'Swallows the exception, which is usually wrong.']
+]});
+
+M.push({
+code: 'O4', track: 'Tier 4 · Objects',
+title: 'Inheritance, super() and the MRO',
+sub: 'What a subclass inherits, how super() cooperates, and where the method actually comes from.',
+lede: 'Inheritance says a subclass <em class="hl">is a</em> kind of its parent and reuses its behaviour. The mechanics worth knowing are the lookup order — the method resolution order — and <code>super()</code>, which does not simply mean "the parent" but "the next class in the MRO".',
+ex: [
+ { t: 'Overriding and extending',
+   code: "class Loader:\n    def __init__(self, table):\n        self.table = table\n\n    def load(self, rows):\n        return f\"loaded {len(rows)} into {self.table}\"\n\nclass ValidatingLoader(Loader):\n    def load(self, rows):\n        clean = [r for r in rows if r.get(\"amount\") is not None]\n        base = super().load(clean)              # extend, do not replace\n        return f\"{base} (dropped {len(rows) - len(clean)})\"\n\nrows = [{\"amount\": 1}, {\"amount\": None}, {\"amount\": 3}]\nprint(Loader(\"txns\").load(rows))\nprint(ValidatingLoader(\"txns\").load(rows))",
+   note: '`super().load(clean)` calls the parent implementation and builds on it. Overriding without calling super replaces the behaviour entirely — both are valid, and which you want is a design decision you should be able to state.' },
+ { t: 'super() in __init__ is the common case',
+   code: "class Job:\n    def __init__(self, name):\n        self.name = name\n        self.attempts = 0\n\nclass RetryingJob(Job):\n    def __init__(self, name, max_attempts):\n        super().__init__(name)                  # parent sets name and attempts\n        self.max_attempts = max_attempts\n\n    def __repr__(self):\n        return f\"RetryingJob({self.name!r}, {self.attempts}/{self.max_attempts})\"\n\nj = RetryingJob(\"silver\", 3)\nprint(j)\nprint(\"inherited attribute:\", j.attempts)",
+   note: 'Forgetting `super().__init__()` is the most common inheritance bug: the parent never runs, so half the attributes never exist and the failure appears later as an AttributeError.' },
+ { t: 'The MRO decides where a method comes from',
+   code: "class Base:\n    def who(self):\n        return \"Base\"\n\nclass Left(Base):\n    def who(self):\n        return \"Left -> \" + super().who()\n\nclass Right(Base):\n    def who(self):\n        return \"Right -> \" + super().who()\n\nclass Both(Left, Right):\n    pass\n\nprint(Both().who())\nprint()\nprint(\"Both, Left, Right, Base  <- the order Python searches\")",
+   note: 'The chain goes Left then Right then Base, not Left straight to Base. `super()` means "the next class in the MRO", which is why cooperative multiple inheritance works at all — and why it is confusing.' },
+ { t: 'isinstance follows the chain',
+   code: "class Error(Exception): pass\nclass LoadError(Error): pass\nclass SchemaError(LoadError): pass\n\ne = SchemaError(\"column missing\")\nprint(\"SchemaError:\", isinstance(e, SchemaError))\nprint(\"LoadError:  \", isinstance(e, LoadError))\nprint(\"Error:      \", isinstance(e, Error))\nprint(\"Exception:  \", isinstance(e, Exception))\n\nfor exc in [SchemaError(\"s\"), LoadError(\"l\"), Error(\"e\")]:\n    try:\n        raise exc\n    except SchemaError:\n        print(\"caught as SchemaError\")\n    except LoadError:\n        print(\"caught as LoadError\")\n    except Error:\n        print(\"caught as Error\")",
+   note: 'A single object is an instance of every class in its chain, which is exactly what makes an exception hierarchy useful: catch the specific type when you can handle it specifically, the base type when you cannot.' },
+ { t: 'Depth is a cost',
+   code: "class A:\n    def process(self): return \"A\"\nclass B(A):\n    def process(self): return \"B -> \" + super().process()\nclass C(B):\n    def process(self): return \"C -> \" + super().process()\nclass D(C):\n    def process(self): return \"D -> \" + super().process()\n\nprint(D().process())\nprint()\nprint(\"to understand D.process you must read four classes\")",
+   note: 'Every level of inheritance is a file a reader must open to understand one call. Two levels is usually fine; four is a design that will be misread. This is the argument that leads directly into composition.' }
+],
+body: [
+ { h: 'What super() actually means', html:
+   '<p>Not "my parent" but <em class="hl">"the next class in the MRO after me"</em>. With single inheritance those coincide, which is why the distinction only surfaces with multiple inheritance — and then surprises people.</p><div class="pre">class Both(Left, Right)\n\nMRO:  Both -> Left -> Right -> Base -> object\n\nLeft.who()\'s super() is RIGHT, not Base.</div>' },
+ { h: 'The rules of thumb', html:
+   '<ul><li><strong>Always call <code>super().__init__()</code></strong> unless you deliberately mean not to.</li><li><strong>Keep hierarchies shallow.</strong> Two levels is usually the limit before readability suffers.</li><li><strong>Inherit for "is a", not for reuse.</strong> Wanting a method is not a reason to inherit — that is composition.</li><li><strong>Avoid multiple inheritance</strong> except for genuine mixins with no state.</li></ul>' },
+ { h: 'Where inheritance genuinely wins', html:
+   '<p>Exception hierarchies — as above — are the clearest case, because catching a base type is exactly the behaviour you want. Framework base classes are the other: subclassing an ORM model or a test case is inheritance doing its job.</p>' }
+],
+call: '"super() means the next class in the MRO rather than the parent, which only matters with multiple inheritance but matters a lot there. I keep hierarchies to about two levels, because every extra level is another file someone has to read to understand one method call."',
+warn: 'Forgetting `super().__init__()` means the parent never initialises, so attributes it was supposed to set simply do not exist. The failure appears later as an AttributeError in an unrelated method.',
+qf: [
+ ['What does super() refer to?', 'The next class in the MRO, which is the parent only under single inheritance.'],
+ ['What is the most common inheritance bug?', 'Forgetting super().__init__(), so parent attributes are never set.'],
+ ['What is the MRO?', 'The order Python searches classes for an attribute — left to right, depth-aware.'],
+ ['Why is a deep hierarchy a problem?', 'Understanding one call requires reading every level.'],
+ ['When is inheritance clearly right?', 'Exception hierarchies and framework base classes — genuine "is a" relationships.'],
+ ['What does isinstance check?', "Whether the object's class chain contains the given class."]
+]});
+
+M.push({
+code: 'O5', track: 'Tier 4 · Objects',
+title: 'Composition over inheritance',
+sub: 'Wanting a method is not a reason to inherit. Hold the object instead.',
+lede: 'Inheritance couples a subclass to its parent’s entire surface, permanently. Composition gives your object a reference to another object and delegates — more typing, far less coupling, and it can be swapped at runtime, which is what makes it testable.',
+ex: [
+ { t: 'The same job, both ways',
+   code: "class Writer:\n    def write(self, rows):\n        return f\"wrote {len(rows)} rows\"\n\n# inheritance: Pipeline IS a Writer\nclass InheritedPipeline(Writer):\n    def run(self, rows):\n        clean = [r for r in rows if r]\n        return self.write(clean)\n\n# composition: Pipeline HAS a Writer\nclass ComposedPipeline:\n    def __init__(self, writer):\n        self.writer = writer\n    def run(self, rows):\n        clean = [r for r in rows if r]\n        return self.writer.write(clean)\n\nrows = [{\"a\": 1}, None, {\"a\": 2}]\nprint(\"inherited:\", InheritedPipeline().run(rows))\nprint(\"composed: \", ComposedPipeline(Writer()).run(rows))",
+   note: 'Identical output. The difference is that `ComposedPipeline` takes its writer as an argument — which is what the next example exploits and inheritance cannot.' },
+ { t: 'Composition makes it testable and swappable',
+   code: "class Writer:\n    def write(self, rows):\n        return f\"wrote {len(rows)} rows to the warehouse\"\n\nclass FakeWriter:\n    def __init__(self):\n        self.received = []\n    def write(self, rows):\n        self.received = list(rows)\n        return f\"captured {len(rows)} rows\"\n\nclass Pipeline:\n    def __init__(self, writer):\n        self.writer = writer\n    def run(self, rows):\n        return self.writer.write([r for r in rows if r])\n\nrows = [{\"a\": 1}, None, {\"a\": 2}]\nprint(\"production:\", Pipeline(Writer()).run(rows))\n\nfake = FakeWriter()\nprint(\"under test:\", Pipeline(fake).run(rows))\nprint(\"test can assert on:\", fake.received)",
+   note: 'The fake needs no inheritance, no framework and no patching — just the same method name. Swapping the collaborator is the entire technique, and it is why composition is the default in testable code.' },
+ { t: 'Inheritance couples you to the whole surface',
+   code: "class Repository:\n    def __init__(self):\n        self._rows = []\n    def add(self, row):\n        self._rows.append(row)\n    def clear(self):\n        self._rows = []\n    def all(self):\n        return list(self._rows)\n\nclass AppendOnlyLog(Repository):\n    pass\n\nlog = AppendOnlyLog()\nlog.add({\"id\": \"t1\"})\nlog.clear()                    # inherited — and it should NOT exist here\nprint(\"append-only log was cleared:\", log.all())\n\nclass SafeLog:\n    def __init__(self):\n        self._repo = Repository()\n    def add(self, row):\n        self._repo.add(row)\n    def all(self):\n        return self._repo.all()\n\nsafe = SafeLog()\nsafe.add({\"id\": \"t1\"})\nprint(\"no clear() to call:\", hasattr(safe, \"clear\"), safe.all())",
+   note: 'The subclass inherited a method that violates its own contract, and there is no way to remove it. Composition exposes only what you choose — which is the real argument, not style preference.' },
+ { t: 'Composing behaviour from small pieces',
+   code: "class UpperCase:\n    def apply(self, row):\n        return {k: (v.upper() if isinstance(v, str) else v) for k, v in row.items()}\n\nclass AddBand:\n    def apply(self, row):\n        return dict(row, band=\"large\" if row[\"amount\"] >= 100 else \"small\")\n\nclass Pipeline:\n    def __init__(self, steps):\n        self.steps = steps\n    def run(self, row):\n        for step in self.steps:\n            row = step.apply(row)\n        return row\n\np = Pipeline([UpperCase(), AddBand()])\nprint(p.run({\"wallet\": \"w-1\", \"amount\": 250}))\n\np2 = Pipeline([AddBand()])\nprint(p2.run({\"wallet\": \"w-1\", \"amount\": 50}))",
+   note: 'Steps are a list you can reorder, extend or shorten at runtime. Expressing the same thing with inheritance would need a class per combination, which is the combinatorial explosion composition exists to avoid.' }
+],
+body: [
+ { h: 'Choosing', html:
+   '<table><thead><tr><th>Use inheritance</th><th>Use composition</th></tr></thead><tbody><tr><td>A genuine "is a" relationship</td><td>A "has a" or "uses a" relationship</td></tr><tr><td>Exception hierarchies</td><td>Anything you want to swap in tests</td></tr><tr><td>A framework requires it</td><td>Behaviour assembled from parts</td></tr><tr><td>The full parent surface is correct</td><td>You want only some of it</td></tr></tbody></table>' },
+ { h: 'The test that settles it', html:
+   '<p>Ask whether every public method of the parent makes sense on the child. If even one does not — like <code>clear()</code> on an append-only log — inheritance is wrong, because you cannot take it away.</p>' },
+ { h: 'Dependency injection is just composition', html:
+   '<p>Passing a collaborator into <code>__init__</code> rather than constructing it inside is the whole of dependency injection. It is why the composed pipeline is testable with a five-line fake and the inherited one is not.</p>' }
+],
+call: '"I ask whether every public method of the parent makes sense on the child — if one does not, inheritance is wrong, because you cannot remove it. Composition means passing the collaborator in, which is also what makes it testable: a fake with the same method name and no framework at all."',
+warn: 'A subclass inherits every public method of its parent, including ones that contradict its own contract. An append-only log that inherits `clear()` cannot remove it, and nothing in the subclass warns a caller.',
+qf: [
+ ['What is composition?', 'Holding a reference to another object and delegating, rather than inheriting from it.'],
+ ['What test decides between them?', 'Whether every public method of the parent makes sense on the child.'],
+ ['Why is composition more testable?', 'The collaborator is passed in, so a test can substitute a fake with the same method names.'],
+ ['What is the cost of composition?', 'More typing — you write the delegating methods yourself.'],
+ ['What is dependency injection?', 'Passing collaborators into __init__ instead of constructing them inside — composition by another name.'],
+ ['When does inheritance still win?', 'Genuine "is a" relationships, exception hierarchies, and framework base classes.']
+]});
+
+M.push({
+code: 'O6', track: 'Tier 4 · Objects',
+title: 'Properties and encapsulation',
+sub: 'A method that looks like an attribute — so you can add validation without changing callers.',
+lede: 'Python has no private attributes and does not need them. The convention is a single underscore, and <code>@property</code> is the escape hatch that lets a plain attribute become a computed or validated one <em class="hl">without breaking any code that already uses it</em>.',
+ex: [
+ { t: 'Start with a plain attribute',
+   code: "class Transaction:\n    def __init__(self, amount):\n        self.amount = amount\n\nt = Transaction(100.0)\nprint(\"read:\", t.amount)\nt.amount = -50.0\nprint(\"nothing stopped a negative amount:\", t.amount)",
+   note: 'A plain attribute is the right starting point — do not write getters and setters preemptively. The question is what happens when you later need validation, and in Python the answer is that you can add it without touching a single caller.' },
+ { t: 'Add a property later; callers do not change',
+   code: "class Transaction:\n    def __init__(self, amount):\n        self.amount = amount          # goes through the setter below\n\n    @property\n    def amount(self):\n        return self._amount\n\n    @amount.setter\n    def amount(self, value):\n        if value < 0:\n            raise ValueError(f\"amount cannot be negative: {value}\")\n        self._amount = float(value)\n\nt = Transaction(100)\nprint(\"read the same way:\", t.amount)\nt.amount = 250\nprint(\"written the same way:\", t.amount)\ntry:\n    t.amount = -50\nexcept ValueError as e:\n    print(\"now rejected:\", e)",
+   note: 'The public interface is identical to the previous example — `t.amount` for reading and writing — but validation now runs. This is why Python does not need getters up front, and it is the whole argument for properties.' },
+ { t: 'A computed property',
+   code: "class Batch:\n    def __init__(self, rows):\n        self.rows = rows\n\n    @property\n    def total(self):\n        return sum(r[\"amount\"] for r in self.rows)\n\n    @property\n    def is_empty(self):\n        return len(self.rows) == 0\n\nb = Batch([{\"amount\": 100.0}, {\"amount\": 250.0}])\nprint(\"total:\", b.total)\n\nb.rows.append({\"amount\": 50.0})\nprint(\"stays correct after a change:\", b.total)\nprint(\"empty batch:\", Batch([]).is_empty)",
+   note: 'A computed property cannot go stale, because it is calculated on access. Storing `self.total` in `__init__` would be wrong the moment `rows` changed — and nothing would report it.' },
+ { t: 'Read-only by omitting the setter',
+   code: "class Run:\n    def __init__(self, run_id):\n        self._run_id = run_id\n\n    @property\n    def run_id(self):\n        return self._run_id\n\nr = Run(\"run-2026-02-01\")\nprint(\"readable:\", r.run_id)\ntry:\n    r.run_id = \"run-tampered\"\nexcept AttributeError as e:\n    print(\"immutable:\", e)",
+   note: 'Omitting the setter makes the attribute read-only. Useful for identifiers and anything set once at construction — and much clearer than a naming convention alone.' },
+ { t: 'The underscore convention',
+   code: "class Loader:\n    def __init__(self, table):\n        self.table = table            # public: callers may use it\n        self._conn = \"internal\"       # private by convention\n        self._cache = {}\n\n    def load(self, rows):\n        return f\"{len(rows)} -> {self.table}\"\n\nl = Loader(\"txns\")\nprint(\"public:\", l.table)\nprint(\"still reachable:\", l._conn)\nprint(\"nothing is enforced — the underscore is a message, not a lock\")\nprint(\"attributes:\", sorted(l.__dict__))",
+   note: 'A single underscore means "not part of the interface, may change". Python trusts you rather than enforcing it, and in practice that trust works because the convention is universal.' }
+],
+body: [
+ { h: 'The naming convention', html:
+   '<table><thead><tr><th>Name</th><th>Means</th><th>Enforced?</th></tr></thead><tbody><tr><td><code>x</code></td><td>Public interface</td><td>n/a</td></tr><tr><td><code>_x</code></td><td>Internal; may change without notice</td><td><b>No</b> — convention</td></tr><tr><td><code>__x</code></td><td>Name-mangled to avoid subclass clashes</td><td>Partly — still reachable</td></tr><tr><td><code>__x__</code></td><td>Reserved for Python protocols</td><td>Do not invent your own</td></tr></tbody></table>' },
+ { h: 'When to use a property', html:
+   '<ul><li><strong>Validation</strong> on assignment.</li><li><strong>A computed value</strong> that must not go stale.</li><li><strong>Read-only</strong> attributes — omit the setter.</li><li><strong>Adding behaviour to an existing attribute</strong> without changing callers.</li></ul><p>And when not to: if a property runs an expensive query or hits the network, make it a method. Attribute syntax promises cheapness, and a property that takes two seconds violates the reader’s expectation.</p>' },
+ { h: 'Why Python does not have private', html:
+   '<p>The design position is that the developer is responsible. Encapsulation is communicated by naming, not enforced by the language, and the practical result is that debugging and testing are far easier — you can always reach in when you genuinely need to.</p>' }
+],
+call: '"Python has no private attributes, so I start with a plain attribute and add a property later if it needs validation — the public interface is identical, so no caller changes. And I keep properties cheap, because attribute syntax promises cheapness and a property that hits the network breaks that."',
+warn: 'A property that performs an expensive operation looks like a free attribute read. Someone puts it in a loop, and a query runs a thousand times — the syntax gave no hint that anything was happening.',
+qf: [
+ ['Does Python have private attributes?', 'No — a single underscore is a convention meaning "internal", not an enforcement.'],
+ ['What does @property do?', 'Makes a method callable as an attribute, so validation or computation can be added without changing callers.'],
+ ['How do you make an attribute read-only?', 'Define the property getter and omit the setter.'],
+ ['Why not write getters and setters up front?', 'Because a plain attribute can become a property later with no change to callers.'],
+ ['When should a property be a method instead?', 'When it is expensive — attribute syntax implies a cheap read.'],
+ ['What does a double underscore prefix do?', 'Name mangling, to avoid clashes in subclasses. It is still reachable.']
+]});
+
+M.push({
+code: 'O7', track: 'Tier 4 · Objects',
+title: 'dataclasses, namedtuple and Enum',
+sub: 'Three ways to stop writing __init__ and __repr__ by hand.',
+lede: 'Most classes in a pipeline are records: a few fields, equality, a readable repr, and no behaviour. Writing that by hand is twenty lines of boilerplate you will get subtly wrong. Three tools generate it, and choosing between them is about mutability and intent.',
+ex: [
+ { t: 'The boilerplate, and what replaces it',
+   code: "from dataclasses import dataclass\n\nclass Manual:\n    def __init__(self, txn_id, amount, wallet=\"unknown\"):\n        self.txn_id = txn_id\n        self.amount = amount\n        self.wallet = wallet\n    def __repr__(self):\n        return f\"Manual(txn_id={self.txn_id!r}, amount={self.amount}, wallet={self.wallet!r})\"\n    def __eq__(self, other):\n        return (self.txn_id, self.amount, self.wallet) == (other.txn_id, other.amount, other.wallet)\n\n@dataclass\nclass Txn:\n    txn_id: str\n    amount: float\n    wallet: str = \"unknown\"\n\nprint(Manual(\"t1\", 100.0))\nprint(Txn(\"t1\", 100.0))\nprint(\"equality for free:\", Txn(\"t1\", 100.0) == Txn(\"t1\", 100.0))\nprint(\"defaults work:\", Txn(\"t2\", 50.0, \"w-1\"))",
+   note: 'Twelve lines become four, and the generated versions cannot drift out of sync with the fields. Note the annotations are what declare the fields — without them the dataclass has nothing to build from.' },
+ { t: 'Dataclasses are mutable and therefore unhashable',
+   code: "from dataclasses import dataclass\n\n@dataclass\nclass Txn:\n    txn_id: str\n    amount: float\n\nt = Txn(\"t1\", 100.0)\nt.amount = 250.0\nprint(\"mutable:\", t)\n\ntry:\n    {t}\nexcept TypeError as e:\n    print(\"unhashable:\", e)\nprint(\"because __eq__ was generated but __hash__ was not — same as any class\")",
+   note: 'Defining equality without hashing is exactly the O3 contract, applied by the decorator. A frozen dataclass gets a hash and becomes usable as a dict key; a mutable one deliberately does not.' },
+ { t: 'namedtuple for immutable records',
+   code: "from collections import namedtuple\n\nPoint = namedtuple(\"Point\", \"wallet amount\")\n\np = Point(\"w-1\", 100.0)\nprint(\"by name:\", p.wallet, p.amount)\nprint(\"repr:\", p)\n\nq = Point(\"w-1\", 100.0)\nprint(\"equal:\", p == q)\nprint(\"hashable:\", len({p, q}))\n\nwallet, amount = p\nprint(\"unpacks like a tuple:\", wallet, amount)",
+   note: 'A namedtuple is a tuple with names: immutable, hashable, unpackable, and comparable. That makes it the right choice for a dict key or a set member, where a dataclass would refuse.' },
+ { t: 'Enum for a closed set of values',
+   code: "from enum import Enum\n\nclass Status(Enum):\n    PENDING = \"pending\"\n    LOADED = \"loaded\"\n    REJECTED = \"rejected\"\n\ns = Status.LOADED\nprint(\"member:\", s, \"| name:\", s.name, \"| value:\", s.value)\nprint(\"identity comparison:\", s is Status.LOADED)\n\ndef describe(status):\n    if status is Status.REJECTED:\n        return \"needs review\"\n    return \"fine\"\n\nprint(describe(Status.REJECTED))\nprint(describe(Status.PENDING))",
+   note: 'The alternative is bare strings, and a typo in `"rejcted"` fails silently as an unmatched branch. An Enum turns that into an AttributeError at the point of the typo — which is the entire reason to use one.' },
+ { t: 'Choosing between them, by behaviour',
+   code: "from dataclasses import dataclass\nfrom collections import namedtuple\n\n@dataclass\nclass Mutable:\n    x: int\n\nImmutable = namedtuple(\"Immutable\", \"x\")\n\nm = Mutable(1)\nm.x = 99\nprint(\"dataclass mutable:\", m)\n\ni = Immutable(1)\ntry:\n    i.x = 99\nexcept AttributeError as e:\n    print(\"namedtuple immutable:\", e)\n\nprint(\"dict key: namedtuple yes ->\", {Immutable(1): \"ok\"}[Immutable(1)])\ntry:\n    {Mutable(1): \"no\"}\nexcept TypeError:\n    print(\"dict key: dataclass no\")",
+   note: 'The decision is mutability. If the record will change after construction, use a dataclass; if it is a value that identifies something — a key, a coordinate, a composite id — use a namedtuple.' }
+],
+body: [
+ { h: 'Choosing', html:
+   '<table><thead><tr><th></th><th>dataclass</th><th>namedtuple</th><th>Enum</th></tr></thead><tbody><tr><td>Mutable</td><td><b>Yes</b></td><td>No</td><td>n/a</td></tr><tr><td>Hashable</td><td>No (unless frozen)</td><td><b>Yes</b></td><td>Yes</td></tr><tr><td>Unpackable</td><td>No</td><td><b>Yes</b></td><td>No</td></tr><tr><td>Defaults</td><td>Yes</td><td>Yes</td><td>n/a</td></tr><tr><td>Right for</td><td>Records you modify</td><td>Keys and value objects</td><td>A closed set of options</td></tr></tbody></table>' },
+ { h: 'Where they show up in a pipeline', html:
+   '<ul><li><strong>dataclass</strong> — a parsed row you enrich as it moves through stages.</li><li><strong>namedtuple</strong> — a composite key like <code>(wallet, date)</code> used in a dict.</li><li><strong>Enum</strong> — load modes, statuses, severities: anything with a fixed set of valid values.</li><li><strong>A plain dict</strong> — still right when the shape is dynamic or comes straight from JSON.</li></ul>' },
+ { h: 'The honest caveat', html:
+   '<p>Do not convert every dict into a dataclass. Rows arriving from JSON or a database are naturally dict-shaped, and forcing them into typed records at the boundary costs allocation and code for benefit you may not need. Use them where the shape is fixed and the type genuinely helps a reader.</p>' }
+],
+call: '"A dataclass generates __init__, __repr__ and __eq__ from annotations, and it is mutable so it is deliberately unhashable — the same eq-without-hash rule as any class. When I need a dict key I reach for a namedtuple instead, and for a closed set of values an Enum, because a bare string typo fails silently as an unmatched branch."',
+warn: 'Using bare strings for statuses means a typo like `"rejcted"` never matches any branch and never raises. The row silently takes the default path — an Enum turns the same typo into an AttributeError at the line that made it.',
+qf: [
+ ['What does @dataclass generate?', '__init__, __repr__ and __eq__ from the annotated fields.'],
+ ['Why is a dataclass unhashable by default?', 'It generates __eq__ without __hash__, because it is mutable.'],
+ ['When do you need a namedtuple instead?', 'When the record must be immutable, hashable, or used as a dict key.'],
+ ['What does an Enum prevent?', 'Typos in a closed set of values failing silently as unmatched branches.'],
+ ['How do you make a dataclass hashable?', 'Freeze it — frozen=True makes it immutable and gives it a hash.'],
+ ['When is a plain dict still right?', 'When the shape is dynamic or arrives from JSON, and typing it adds no value.']
+]});
+
+M.push({
+code: 'T1', track: 'Tier 5 · Iteration',
+title: 'The iterator protocol',
+sub: 'What `for` actually does — and why the same loop works on lists, files, dicts and your own objects.',
+lede: 'A <code>for</code> loop is not built into the types it iterates. It calls <code>iter()</code> to get an iterator, then <code>next()</code> repeatedly until <code>StopIteration</code>. Everything iterable in Python — lists, dicts, files, generators, your own classes — works because it implements that two-method contract.',
+ex: [
+ { t: 'The loop, unrolled by hand',
+   code: "rows = [{\"id\": \"t1\"}, {\"id\": \"t2\"}]\n\nit = iter(rows)\nwhile True:\n    try:\n        row = next(it)\n    except StopIteration:\n        break\n    print(\"got\", row[\"id\"])\n\nprint()\nprint(\"that IS the for loop — nothing more\")",
+   note: 'Every `for` in Python is this. Once you have seen it unrolled, generators, files and custom iterables stop being separate features and become one contract implemented three ways.' },
+ { t: 'Iterable versus iterator',
+   code: "rows = [1, 2, 3]\n\nprint(\"a list is iterable:\", hasattr(rows, \"__iter__\"))\nit = iter(rows)\nprint(\"iter() gives an iterator:\", type(it).__name__)\n\nprint(\"first:\", next(it))\nprint(\"rest: \", list(it), \"<- the iterator is consumed\")\nprint(\"but the list is fine:\", rows)\n\na, b = iter(rows), iter(rows)\nprint(\"two independent iterators:\", next(a), next(b))",
+   note: 'An <em>iterable</em> can produce iterators; an <em>iterator</em> is a single-use cursor. A list is iterable and can hand out many iterators; a generator IS an iterator, which is exactly why it exhausts after one pass.' },
+ { t: 'Implementing the protocol yourself',
+   code: "class Countdown:\n    def __init__(self, start):\n        self.start = start\n\n    def __iter__(self):\n        n = self.start\n        while n > 0:\n            yield n\n            n -= 1\n\nc = Countdown(3)\nprint(\"first pass: \", list(c))\nprint(\"second pass:\", list(c), \"<- re-iterable\")\n\nfor n in Countdown(2):\n    print(\"tick\", n)",
+   note: 'Making `__iter__` a generator function is the easiest correct implementation: each call creates a fresh generator, so the object is re-iterable. This is what you almost always want.' },
+ { t: 'The self-returning iterator, and its cost',
+   code: "class Cursor:\n    def __init__(self, rows):\n        self.rows = rows\n        self.i = 0\n\n    def __iter__(self):\n        return self                # I am my own iterator\n\n    def __next__(self):\n        if self.i >= len(self.rows):\n            raise StopIteration\n        row = self.rows[self.i]\n        self.i += 1\n        return row\n\nc = Cursor([1, 2, 3])\nprint(\"first pass: \", list(c))\nprint(\"second pass:\", list(c), \"<- exhausted, like a generator\")",
+   note: 'Returning `self` makes the object single-use, because there is only one position counter. That is correct for something genuinely stream-like — a file, a network cursor — and wrong for a collection.' },
+ { t: 'Unpacking and starred assignment use the same protocol',
+   code: "def rows():\n    yield {\"id\": \"t1\"}\n    yield {\"id\": \"t2\"}\n    yield {\"id\": \"t3\"}\n\nfirst, *rest = rows()\nprint(\"first:\", first[\"id\"], \" rest:\", [r[\"id\"] for r in rest])\n\na, b, c = \"xyz\"\nprint(\"strings too:\", a, b, c)\n\ndef pair():\n    yield 1\n    yield 2\nx, y = pair()\nprint(\"from a generator:\", x, y)",
+   note: 'Unpacking, `zip`, `sum`, `sorted`, `in`, `min` — all of them go through `iter()`. Implementing the protocol once makes your object work with the entire standard library rather than just `for`.' }
+],
+body: [
+ { h: 'The contract', html:
+   '<div class="pre code">iter(x)   ->  calls x.__iter__()   returns an ITERATOR\nnext(it)  ->  calls it.__next__()  returns the next value\n                                   or raises StopIteration</div><table><thead><tr><th></th><th>Iterable</th><th>Iterator</th></tr></thead><tbody><tr><td>Has</td><td><code>__iter__</code></td><td><code>__iter__</code> and <code>__next__</code></td></tr><tr><td>Re-usable</td><td>Usually yes</td><td><b>No</b> — single pass</td></tr><tr><td>Examples</td><td>list, dict, str, range</td><td>generator, file, map, filter</td></tr></tbody></table>' },
+ { h: 'Which implementation to choose', html:
+   '<ul><li><strong><code>__iter__</code> as a generator function</strong> — the default. Re-iterable, short, hard to get wrong.</li><li><strong><code>__iter__</code> returning <code>self</code> plus <code>__next__</code></strong> — only for genuinely single-pass sources like a file handle or a network cursor.</li><li><strong><code>__getitem__</code> alone</strong> — legacy fallback; Python will iterate integers from 0 until IndexError. Do not rely on it.</li></ul>' },
+ { h: 'Why this matters in a pipeline', html:
+   '<p>A function that accepts "rows" should work whether it is handed a list, a generator or a database cursor. Writing against the iterator protocol rather than against <code>list</code> is what makes a transform reusable — and it is why <code>len(rows)</code> inside a transform quietly forces the caller to materialise everything.</p>' }
+],
+call: '"A for loop is just iter() then next() until StopIteration, so anything implementing that contract works with the whole standard library, not only for. I make __iter__ a generator function so the object is re-iterable — returning self is correct only for genuinely single-pass sources like a file cursor."',
+warn: 'Calling `len(rows)` inside a transform forces the caller to pass a list. The function silently loses the ability to accept a generator, and the cost lands on whoever streams a large source into it.',
+qf: [
+ ['What does a for loop actually do?', 'Calls iter() to get an iterator, then next() repeatedly until StopIteration.'],
+ ['Iterable versus iterator?', 'An iterable can produce iterators; an iterator is a single-use cursor with __next__.'],
+ ['Why does a generator exhaust after one pass?', 'A generator is an iterator — there is one position, and it only moves forward.'],
+ ['What is the easiest correct __iter__?', 'A generator function, so each call returns a fresh iterator and the object stays re-iterable.'],
+ ['When should __iter__ return self?', 'Only for genuinely single-pass sources like a file handle or network cursor.'],
+ ['Why avoid len() inside a transform?', 'It forces the input to be a list, so the function can no longer accept a generator.']
+]});
+
+M.push({
+code: 'T2', track: 'Tier 5 · Iteration',
+title: 'itertools in anger',
+sub: 'The functions that replace hand-written loops — and keep the data streaming.',
+lede: 'Most loops that build an intermediate list have a lazy equivalent in <code>itertools</code>. The value is not brevity: it is that the whole chain stays streaming, so memory stays flat regardless of input size.',
+ex: [
+ { t: 'islice, chain and the infinite source',
+   code: "from itertools import count, islice, chain\n\ndef ids():\n    for n in count(1):\n        yield f\"t-{n:04d}\"\n\nprint(\"first three:\", list(islice(ids(), 3)))\nprint(\"a window:   \", list(islice(ids(), 5, 8)))\n\nbatch_a = [{\"id\": \"a1\"}, {\"id\": \"a2\"}]\nbatch_b = [{\"id\": \"b1\"}]\nmerged = chain(batch_a, batch_b)\nprint(\"chained:\", [r[\"id\"] for r in merged])",
+   note: '`count` never ends and `islice` bounds it without materialising. `chain` concatenates iterables lazily — the alternative, `list(a) + list(b)`, builds both in memory to produce a third.' },
+ { t: 'accumulate for running totals',
+   code: "from itertools import accumulate\n\namounts = [100.0, 250.0, 75.0, 900.0]\n\nprint(\"running total:\", list(accumulate(amounts)))\nprint(\"running max:  \", list(accumulate(amounts, lambda a, b: a if a > b else b)))\n\nbalance = 1000.0\nprint(\"balance over time:\", [balance - t for t in accumulate(amounts)])",
+   note: 'A running aggregate with no accumulator variable and no mutation. The second form takes any two-argument function, which covers running max, running min, and compounding.' },
+ { t: 'groupby needs sorted input — and that is the trap',
+   code: "from itertools import groupby\n\nrows = [\n    {\"wallet\": \"w-1\", \"amount\": 100},\n    {\"wallet\": \"w-2\", \"amount\": 250},\n    {\"wallet\": \"w-1\", \"amount\": 75},\n]\n\nprint(\"UNSORTED input:\")\nfor key, group in groupby(rows, key=lambda r: r[\"wallet\"]):\n    print(f\"  {key}: {len(list(group))} row(s)\")\n\nprint()\nprint(\"sorted first:\")\nrows.sort(key=lambda r: r[\"wallet\"])\nfor key, group in groupby(rows, key=lambda r: r[\"wallet\"]):\n    print(f\"  {key}: {len(list(group))} row(s)\")",
+   note: 'w-1 appears twice in the first output because groupby only groups *consecutive* runs. It is not SQL GROUP BY. Sort by the same key first, or use a dict — which is usually simpler and does not need the sort.' },
+ { t: 'takewhile and dropwhile stop at the first failure',
+   code: "from itertools import takewhile, dropwhile\n\nreadings = [1, 2, 3, 10, 2, 1]\n\nprint(\"takewhile <5:\", list(takewhile(lambda x: x < 5, readings)))\nprint(\"dropwhile <5:\", list(dropwhile(lambda x: x < 5, readings)))\nprint(\"filter    <5:\", list(filter(lambda x: x < 5, readings)))\nprint()\nprint(\"takewhile STOPS at 10; filter keeps scanning and removes it\")",
+   note: 'The distinction matters on a sorted stream: `takewhile` can stop reading early, which is a real saving on a large source. `filter` must examine every element.' },
+ { t: 'zip_longest and the silent truncation zip causes',
+   code: "from itertools import zip_longest\n\nids = [\"t1\", \"t2\", \"t3\"]\namounts = [100.0, 250.0]\n\nprint(\"zip:        \", list(zip(ids, amounts)))\nprint(\"zip_longest:\", list(zip_longest(ids, amounts, fillvalue=0.0)))\nprint()\nprint(\"zip silently dropped t3 — no error, no warning\")",
+   note: 'This is a genuine data-loss bug: `zip` stops at the shortest input. If the two sequences are supposed to be the same length, assert it rather than trusting `zip` to tell you — it will not.' },
+ { t: 'tee when you genuinely need two passes',
+   code: "from itertools import tee\n\ndef source():\n    for i in range(5):\n        yield {\"id\": f\"t{i}\", \"amount\": i * 100.0}\n\na, b = tee(source())\ntotal = sum(r[\"amount\"] for r in a)\ncount = sum(1 for r in b)\n\nprint(f\"total={total} count={count} mean={total/count}\")\nprint()\nprint(\"tee buffers what the slower branch has not consumed —\")\nprint(\"on a large source that buffer is the memory you were avoiding\")",
+   note: '`tee` looks like free re-iteration and is not: it caches every element the lagging iterator has not yet seen. For two aggregates over a large source, a single pass computing both is better.' }
+],
+body: [
+ { h: 'The ones worth memorising', html:
+   '<table><thead><tr><th>Function</th><th>Does</th></tr></thead><tbody><tr><td><code>islice(it, n)</code></td><td>First n, lazily — bounds an infinite source</td></tr><tr><td><code>chain(a, b)</code></td><td>Concatenate iterables without building a list</td></tr><tr><td><code>accumulate(it)</code></td><td>Running totals, or any two-arg function</td></tr><tr><td><code>groupby(it, key)</code></td><td>Group <b>consecutive</b> runs — sort first</td></tr><tr><td><code>takewhile</code> / <code>dropwhile</code></td><td>Stop or start at the first boundary</td></tr><tr><td><code>zip_longest</code></td><td>zip without silent truncation</td></tr><tr><td><code>tee</code></td><td>Two iterators from one — at a memory cost</td></tr><tr><td><code>combinations</code> / <code>product</code></td><td>Pairs and cartesian products</td></tr></tbody></table>' },
+ { h: 'The two traps', html:
+   '<ol><li><strong><code>groupby</code> is not SQL GROUP BY.</strong> It groups consecutive runs only. On unsorted input you get a key back several times, and a naive count is wrong.</li><li><strong><code>zip</code> truncates to the shortest input</strong> with no error. If equal length is a requirement, assert it — in Python 3.10+ <code>zip(..., strict=True)</code> raises instead.</li></ol>' },
+ { h: 'When a plain loop is better', html:
+   '<p>If the itertools version needs a lambda and a comment to be readable, write the loop. The point of these is streaming and clarity together — a clever one-liner that nobody can modify is a worse outcome than four obvious lines.</p>' }
+],
+call: '"itertools keeps a chain lazy, so memory stays flat regardless of input size — islice bounds an infinite source and chain concatenates without building a list. The two traps are that groupby only groups consecutive runs, so it needs sorted input, and that zip truncates to the shortest sequence silently."',
+warn: '`zip` stops at the shortest input and reports nothing. Two sequences that should be parallel but differ by one row produce a result quietly missing the tail — use `zip_longest`, or assert the lengths match.',
+qf: [
+ ['What does islice do that slicing cannot?', 'Works on any iterator, including infinite ones, without materialising.'],
+ ['Why does groupby need sorted input?', 'It groups only consecutive runs, so unsorted input yields the same key several times.'],
+ ['What does zip do with unequal lengths?', 'Truncates to the shortest, silently.'],
+ ['takewhile versus filter?', 'takewhile stops at the first failure; filter examines every element.'],
+ ['What does accumulate produce?', 'A running total, or a running result of any two-argument function.'],
+ ['What is the hidden cost of tee?', 'It buffers everything the lagging iterator has not consumed.'],
+ ['When should you write a plain loop instead?', 'When the itertools version needs a lambda and a comment to be readable.']
+]});
+
+M.push({
+code: 'Y1', track: 'Tier 10 · Performance and internals',
+title: 'Measure before you optimise',
+sub: 'Timing, counting operations, and the discipline of changing one thing.',
+lede: 'Optimising without measuring is guessing, and Python programmers guess wrong reliably — the slow line is almost never the one that looks slow. The habit is: measure, find the dominant cost, change one thing, measure again.',
+ex: [
+ { t: 'Count the work, not the wall clock',
+   code: "def naive(rows, keys):\n    ops = 0\n    out = []\n    for k in keys:\n        for r in rows:            # rescans the whole list per key\n            ops += 1\n            if r[\"k\"] == k:\n                out.append(r)\n    return out, ops\n\ndef indexed(rows, keys):\n    ops = 0\n    index = {}\n    for r in rows:\n        ops += 1\n        index.setdefault(r[\"k\"], []).append(r)\n    out = []\n    for k in keys:\n        ops += 1\n        out.extend(index.get(k, []))\n    return out, ops\n\nrows = [{\"k\": f\"k{i%10}\"} for i in range(100)]\nkeys = [f\"k{i}\" for i in range(10)]\n\n_, a = naive(rows, keys)\n_, b = indexed(rows, keys)\nprint(f\"naive:   {a:>5} operations\")\nprint(f\"indexed: {b:>5} operations\")\nprint(f\"ratio:   {a/b:.1f}x\")",
+   note: 'Counting operations is more honest than timing on a small input, because it shows the *shape* of the cost rather than one machine on one day. 1000 versus 110 here; at 10,000 rows it is 100,000 versus 10,010.' },
+ { t: 'The cost is rarely where you think',
+   code: "def build_string_slow(n):\n    s = \"\"\n    for i in range(n):\n        s = s + str(i)        # builds a new string every time\n    return len(s)\n\ndef build_string_fast(n):\n    parts = []\n    for i in range(n):\n        parts.append(str(i))   # append is cheap\n    return len(\"\".join(parts))\n\nprint(\"slow result:\", build_string_slow(200))\nprint(\"fast result:\", build_string_fast(200))\nprint()\nprint(\"same answer; the first copies the whole string on every iteration\")\nprint(\"because strings are immutable — O(n^2) total work\")",
+   note: 'Repeated string concatenation in a loop is quadratic because each `+` copies everything so far. `"".join(parts)` allocates once. This is the most common accidental quadratic in Python after list membership.' },
+ { t: 'Membership: the single highest-value change',
+   code: "def with_list(items, lookups):\n    known = list(items)\n    ops = 0\n    hits = 0\n    for x in lookups:\n        for k in known:        # what `x in known` does internally\n            ops += 1\n            if k == x:\n                hits += 1\n                break\n    return hits, ops\n\ndef with_set(items, lookups):\n    known = set(items)\n    hits = sum(1 for x in lookups if x in known)\n    return hits, len(lookups)\n\nitems = [f\"id{i}\" for i in range(200)]\nlookups = [f\"id{i}\" for i in range(0, 200, 2)]\n\nh1, o1 = with_list(items, lookups)\nh2, o2 = with_set(items, lookups)\nprint(f\"list: {h1} hits in ~{o1} comparisons\")\nprint(f\"set:  {h2} hits in ~{o2} lookups\")",
+   note: 'One character of difference — `set(...)` instead of `list(...)` — turns a scan into a hash lookup. If you take one performance habit from this tier, take this one.' },
+ { t: 'Change one thing at a time',
+   code: "versions = {\n    \"baseline\":            {\"ops\": 10000, \"note\": \"nested loop\"},\n    \"set for membership\":  {\"ops\": 1200,  \"note\": \"one change\"},\n    \"+ avoid re-parsing\":  {\"ops\": 900,   \"note\": \"one more change\"},\n    \"+ batch the writes\":  {\"ops\": 880,   \"note\": \"diminishing\"},\n}\n\nprev = None\nfor name, v in versions.items():\n    delta = \"\" if prev is None else f\"{(1 - v['ops']/prev):.0%} faster\"\n    print(f\"{name:22} {v['ops']:>6}  {delta:>12}   {v['note']}\")\n    prev = v[\"ops\"]\n\nprint()\nprint(\"the first change did 88% of the work; the last did 2%\")\nprint(\"stop when the next change stops paying\")",
+   note: 'One change per measurement is what lets you attribute the improvement. It also tells you when to stop — the last two changes here cost more code than they saved time.' }
+],
+body: [
+ { h: 'The order', html:
+   '<ol><li><strong>Is it actually slow?</strong> Slow relative to what requirement?</li><li><strong>Where?</strong> Time the stages, or count operations. Do not guess.</li><li><strong>Why?</strong> Algorithmic (the shape) or constant-factor (the work per item)?</li><li><strong>Change one thing.</strong> Re-measure.</li><li><strong>Stop</strong> when it meets the requirement.</li></ol><p>Algorithmic wins dominate. Turning O(n²) into O(n) beats every micro-optimisation combined, and no amount of tuning rescues the wrong shape.</p>' },
+ { h: 'The real tools', html:
+   '<div class="pre code">import timeit                 <i>micro-benchmarks, repeated</i>\nimport cProfile               <i>which function dominates</i>\ncProfile.run("main()", sort="cumtime")\n\npython -m cProfile -s cumtime job.py\npy-spy top --pid 1234         <i>sampling profiler, safe in production</i></div><p><code>cumtime</code> is the column to sort by — it includes everything a function called, which is what points at the branch of the pipeline responsible.</p>' },
+ { h: 'What to suspect first in a pipeline', html:
+   '<ul><li>Membership tests against a list.</li><li>Repeated string concatenation.</li><li>Re-reading or re-parsing the same data.</li><li>A round trip per row instead of per batch.</li><li>Materialising a whole file to compute one aggregate.</li></ul>' }
+],
+call: '"I measure before changing anything, because the slow line is almost never the one that looks slow. Algorithmic shape dominates — turning a list membership test into a set beats every micro-optimisation combined — and I change one thing per measurement so I can attribute the improvement."',
+warn: 'Repeated string concatenation in a loop is quadratic, because strings are immutable and every `+` copies everything so far. It reads as the obvious way to build a string and it is the wrong one.',
+qf: [
+ ['What is the first question before optimising?', 'Whether it is actually too slow for the requirement.'],
+ ['Why count operations rather than time on small input?', 'It shows the shape of the cost rather than one machine on one day.'],
+ ['What dominates — algorithm or constant factor?', 'The algorithm. O(n²) to O(n) beats every micro-optimisation.'],
+ ['Why is string concatenation in a loop slow?', 'Strings are immutable, so each + copies everything so far — quadratic overall.'],
+ ['What is the highest-value single change?', 'Using a set instead of a list for membership tests.'],
+ ['Why change one thing at a time?', 'Otherwise you cannot attribute the improvement or revert intelligently.']
+]});
+
+M.push({
+code: 'Y2', track: 'Tier 10 · Performance and internals',
+title: 'The cost of Python operations',
+sub: 'What is O(1), what is O(n), and the ones that surprise people.',
+lede: 'Knowing the complexity of the operations you use every day is what lets you spot a quadratic loop while writing it rather than after profiling it. Most of the table is unsurprising; four entries are not.',
+ex: [
+ { t: 'Membership: the difference that matters most',
+   code: "items = list(range(500))\nas_set = set(items)\nas_dict = {k: True for k in items}\n\ndef scan_cost(target, seq):\n    n = 0\n    for x in seq:\n        n += 1\n        if x == target:\n            break\n    return n\n\nprint(\"list, best case (first):\", scan_cost(0, items))\nprint(\"list, worst case (last):\", scan_cost(499, items))\nprint(\"list, missing:          \", scan_cost(9999, items))\nprint()\nprint(\"set membership is one hash lookup regardless:\", 499 in as_set, 9999 in as_set)\nprint(\"dict is the same:\", 499 in as_dict)",
+   note: 'A list scan costs one comparison per element until it matches — and the worst case is a miss, which examines everything. A set is one hash computation whatever the size.' },
+ { t: 'Insertion and removal at the front versus the end',
+   code: "from collections import deque\n\ndef list_front_cost(n):\n    xs = []\n    shifts = 0\n    for i in range(n):\n        xs.insert(0, i)      # every existing element moves right\n        shifts += len(xs) - 1\n    return shifts\n\ndef list_end_cost(n):\n    xs = []\n    for i in range(n):\n        xs.append(i)         # no shifting\n    return 0\n\nprint(\"insert(0) on 100 items shifted:\", list_front_cost(100), \"elements\")\nprint(\"append on 100 items shifted:   \", list_end_cost(100), \"elements\")\n\nd = deque()\nfor i in range(5):\n    d.appendleft(i)\nprint(\"deque appendleft is O(1):\", list(d))",
+   note: '`list.insert(0, x)` and `list.pop(0)` move every remaining element. For a queue use `collections.deque`, which is O(1) at both ends. This is the second-most-common accidental quadratic.' },
+ { t: 'Slicing and concatenation copy',
+   code: "rows = list(range(10))\n\ns = rows[2:5]\nprint(\"slice is a new list:\", s, \" same object:\", s is rows)\n\ncombined = rows[:3] + rows[7:]\nprint(\"concatenation copies both sides:\", combined)\n\ntotal = []\nfor chunk in [[1,2],[3,4],[5,6]]:\n    total = total + chunk        # copies the accumulator every time\nprint(\"naive accumulate:\", total)\n\ntotal2 = []\nfor chunk in [[1,2],[3,4],[5,6]]:\n    total2.extend(chunk)          # amortised O(1) per item\nprint(\"extend:\", total2)",
+   note: 'Both slicing and `+` allocate a new list and copy. Inside a loop that turns a linear job quadratic — use `extend` or a list comprehension, which allocate once.' },
+ { t: 'sorted is O(n log n) and the key is called once per item',
+   code: "calls = {\"n\": 0}\n\ndef expensive_key(row):\n    calls[\"n\"] += 1\n    return row[\"amount\"]\n\nrows = [{\"amount\": i} for i in [5, 3, 9, 1, 7]]\nresult = sorted(rows, key=expensive_key)\n\nprint(\"sorted:\", [r[\"amount\"] for r in result])\nprint(\"items:\", len(rows), \" key calls:\", calls[\"n\"])\nprint()\nprint(\"the key is computed ONCE per item, not once per comparison —\")\nprint(\"so an expensive key is affordable; an expensive __lt__ is not\")",
+   note: 'This is why `sorted(key=...)` is preferred over defining `__lt__` for a one-off sort: the key is decorated once per element, whereas a comparison method runs O(n log n) times.' }
+],
+body: [
+ { h: 'The table worth knowing', html:
+   '<table><thead><tr><th>Operation</th><th>list</th><th>dict / set</th><th>deque</th></tr></thead><tbody><tr><td><code>x in c</code></td><td><b>O(n)</b></td><td>O(1)</td><td>O(n)</td></tr><tr><td>Index / key access</td><td>O(1)</td><td>O(1)</td><td>O(n) middle</td></tr><tr><td>Append / add</td><td>O(1)*</td><td>O(1)</td><td>O(1)</td></tr><tr><td>Insert or pop at front</td><td><b>O(n)</b></td><td>n/a</td><td><b>O(1)</b></td></tr><tr><td>Pop at end</td><td>O(1)</td><td>O(1)</td><td>O(1)</td></tr><tr><td>Slice of length k</td><td>O(k)</td><td>n/a</td><td>n/a</td></tr><tr><td>Sort</td><td>O(n log n)</td><td>n/a</td><td>n/a</td></tr><tr><td>Min / max / sum</td><td>O(n)</td><td>O(n)</td><td>O(n)</td></tr></tbody></table><p class="snote">* amortised — an occasional resize copies, but averaged over many appends it is constant.</p>' },
+ { h: 'The four that surprise people', html:
+   '<ol><li><strong><code>x in list</code> is O(n).</strong> Inside a loop over n items, that is n².</li><li><strong><code>list.insert(0, x)</code> and <code>pop(0)</code> are O(n).</strong> Use a deque.</li><li><strong>String <code>+</code> in a loop is quadratic.</strong> Use join.</li><li><strong>Slicing copies.</strong> <code>rows[:]</code> is not free on a large list.</li></ol>' },
+ { h: 'Memory has a shape too', html:
+   '<p>A dict costs more per entry than a list, and a set more than a tuple. For a few million small records that difference is real — which is why the Tier 2 escalation ladder starts with "read fewer columns" rather than "use a faster structure".</p>' }
+],
+call: '"The four costs I keep in mind are that list membership is O(n) while set is O(1), that insert and pop at the front of a list are O(n) so a queue needs a deque, that string concatenation in a loop is quadratic, and that slicing copies. Almost every accidental quadratic I have written was one of those four."',
+warn: '`list.pop(0)` in a loop looks like a natural queue and moves every remaining element on each call. On a hundred thousand items that is five billion moves, and nothing about the line suggests it.',
+qf: [
+ ['What is the cost of `x in some_list`?', 'O(n) — a scan. In a set or dict it is O(1).'],
+ ['Why is list.insert(0, x) slow?', 'Every existing element shifts right — O(n) per insertion.'],
+ ['What should you use for a queue?', 'collections.deque — O(1) at both ends.'],
+ ['Is slicing free?', 'No — it allocates and copies the slice.'],
+ ['How often is a sort key called?', 'Once per element, not once per comparison.'],
+ ['What is the amortised cost of list.append?', 'O(1) — occasional resizes averaged over many appends.']
+]});
+
+M.push({
+code: 'Y3', track: 'Tier 10 · Performance and internals',
+title: 'Interning, identity and reference counting',
+sub: 'Why `a is b` is sometimes True for equal values — and what CPython is doing underneath.',
+lede: 'CPython caches small integers and some strings, so identity comparisons accidentally succeed for common values and then fail on uncommon ones. Understanding why also explains reference counting, garbage collection and why the interpreter frees memory when it does.',
+ex: [
+ { t: 'Small integers are cached \u2014 in CPython', ref:true,
+   code: "a = 100\nb = 100\nprint(a is b)          # True  -- cached\n\nc = 100000\nd = 100000\nprint(c is d)          # False -- not cached\n\n# both comparisons are wrong to write; only == compares values",
+   note: 'CPython pre-allocates the integers from -5 to 256, so every reference to 100 is literally the same object. Nothing in the language promises this. This bench cannot reproduce it \u2014 its numbers are host-language primitives \u2014 so the output above is CPython\u2019s, shown rather than simulated.' },
+ { t: 'String interning \u2014 also CPython', ref:true,
+   code: "a = \"wallet\"\nb = \"wallet\"\nprint(a is b)          # True  -- interned at compile time\n\nc = \"w-1 has a space\"\nd = \"w-1 has a space\"\nprint(c is d)          # False -- built at runtime\n\ne = \"\".join([\"wal\", \"let\"])\nprint(e is a, e == a)  # False True",
+   note: 'Literals that look like identifiers are interned at compile time; strings built at runtime generally are not. Same conclusion: compare strings with ==, always.' },
+ { t: 'What identity DOES reliably mean',
+   code: "a = [1, 2]\nb = [1, 2]\nc = a\n\nprint(\"equal contents:\", a == b)\nprint(\"same object:   \", a is b)\nprint(\"c is a:        \", c is a)\n\nc.append(3)\nprint(\"mutating through c:\", a)\n\nx = None\nprint(\"None is a singleton:\", x is None)",
+   note: 'This part is guaranteed and the bench models it correctly. Two containers with equal contents are separate objects; assignment binds a second name to the same one; and None is a genuine singleton, which is why `is None` is the one correct use of `is`.' },
+ { t: 'Reference counting decides when memory is freed',
+   code: "class Tracked:\n    live = 0\n    def __init__(self, name):\n        self.name = name\n        Tracked.live += 1\n    def release(self):\n        Tracked.live -= 1\n\na = Tracked(\"first\")\nprint(\"after creating one:\", Tracked.live)\n\nb = a\nprint(\"two names, still one object:\", Tracked.live)\n\nb.release()\nb = None\nprint(\"after releasing:\", Tracked.live)\nprint()\nprint(\"CPython frees an object when its reference count hits zero\")",
+   note: 'CPython frees immediately at zero references rather than waiting for a collector, which is why a large list dropped inside a loop releases memory straight away. The cycle collector exists only for reference cycles that counting cannot resolve.' },
+ { t: 'A lingering reference is the usual memory leak',
+   code: "CACHE = []\n\ndef process(rows):\n    result = [r[\"id\"] for r in rows]\n    CACHE.append(rows)          # holds the ENTIRE input alive\n    return result\n\nfor batch in range(3):\n    rows = [{\"id\": f\"t{batch}-{i}\", \"payload\": \"x\" * 50} for i in range(4)]\n    process(rows)\n\nprint(\"batches processed: 3\")\nprint(\"batches still held in CACHE:\", len(CACHE))\nprint(\"rows held alive:\", sum(len(b) for b in CACHE))\nprint()\nprint(\"nothing can be freed while CACHE references it\")",
+   note: 'Python has no leaks in the C sense \u2014 it has unintended references. A module-level list, a closure, or a cache that never evicts keeps everything it points at alive for the life of the process.' }
+],
+body: [
+ { h: 'What is guaranteed and what is not', html:
+   '<table><thead><tr><th>Behaviour</th><th>Guaranteed?</th></tr></thead><tbody><tr><td><code>a == b</code> for equal values</td><td><b>Yes</b></td></tr><tr><td><code>a is b</code> for small ints</td><td>No — CPython detail</td></tr><tr><td><code>a is b</code> for interned strings</td><td>No — CPython detail</td></tr><tr><td><code>x is None</code></td><td><b>Yes</b> — None is a singleton</td></tr><tr><td>Freed at zero references</td><td>CPython yes; other runtimes no</td></tr></tbody></table>' },
+ { h: 'The rule', html:
+   '<p>Use <code>is</code> only for <code>None</code>, <code>True</code> and <code>False</code>. Everywhere else use <code>==</code>. Every counter-example in this module is a CPython implementation detail that another interpreter is free to change.</p>' },
+ { h: 'Where memory actually goes in a pipeline', html:
+   '<ul><li><strong>A cache with no eviction</strong> — grows for the process lifetime.</li><li><strong>A module-level accumulator</strong> — the mutable-default bug at module scope.</li><li><strong>Holding the input after producing the output</strong> — as above.</li><li><strong>A closure capturing a large object</strong> it only needed one field from.</li></ul><p>The fix is always the same: drop the reference. <code>del</code>, reassign, or restructure so the large object goes out of scope.</p>' }
+],
+call: '"CPython caches small integers and interns identifier-like strings, which is why `is` accidentally works for common values and fails on larger ones — so I use `is` only for None. And Python does not leak memory in the C sense; it holds unintended references, usually a cache that never evicts."',
+warn: 'Relying on `is` for value comparison works for integers up to 256 and short strings, then silently returns False. The test data passes and the production data does not.',
+qf: [
+ ['Why does `a is b` work for small integers?', 'CPython pre-allocates -5 to 256, so all references share one object.'],
+ ['Is that behaviour guaranteed?', 'No — it is a CPython implementation detail.'],
+ ['When is `is` correct?', 'Only for None, True and False.'],
+ ['When does CPython free an object?', 'When its reference count reaches zero — immediately, not at a later sweep.'],
+ ['What is the cycle collector for?', 'Reference cycles that counting alone cannot reclaim.'],
+ ['What causes memory growth in a Python pipeline?', 'Unintended references — a cache without eviction, a module-level accumulator, or holding the input after producing the output.']
+]});
+
+M.push({
+code: 'Y4', track: 'Tier 10 · Performance and internals',
+title: 'Memory layout: dicts, slots and the cost per object',
+sub: 'Every attribute lives in a dict unless you say otherwise.',
+lede: 'A normal Python object stores its attributes in a per-instance dictionary. That is flexible and it costs memory — which matters exactly once: when you have millions of small objects. Knowing the alternatives, and when not to reach for them, is the whole of this module.',
+ex: [
+ { t: 'Objects carry a dict',
+   code: "class Plain:\n    def __init__(self, tid, amount):\n        self.tid = tid\n        self.amount = amount\n\np = Plain(\"t1\", 100.0)\nprint(\"attributes live in a dict:\", p.__dict__)\n\np.added_later = \"anything\"\nprint(\"and it is open:\", sorted(p.__dict__))\n\nclass Slotted:\n    __slots__ = (\"tid\", \"amount\")\n    def __init__(self, tid, amount):\n        self.tid = tid\n        self.amount = amount\n\ns = Slotted(\"t1\", 100.0)\nprint(\"slots work the same for reading:\", s.tid, s.amount)",
+   note: '`__dict__` is why you can attach any attribute at any time. `__slots__` replaces it with a fixed array of named fields — smaller and faster, at the cost of that flexibility.' },
+ { t: 'What slots take away',
+   code: "class Slotted:\n    __slots__ = (\"tid\",)\n    def __init__(self, tid):\n        self.tid = tid\n\ns = Slotted(\"t1\")\nprint(\"declared attribute:\", s.tid)\n\ntry:\n    s.extra = \"no\"\nexcept AttributeError as e:\n    print(\"undeclared attribute refused:\", e)\n\ntry:\n    print(s.__dict__)\nexcept AttributeError as e:\n    print(\"no __dict__ either:\", e)",
+   note: 'The typo protection is a genuine secondary benefit: `s.tidd = 1` fails loudly instead of silently creating a new attribute. But losing `__dict__` breaks anything that introspects, including some serialisation libraries.' },
+ { t: 'Comparing the options for a record',
+   code: "from collections import namedtuple\nfrom dataclasses import dataclass\n\n@dataclass\nclass AsDataclass:\n    tid: str\n    amount: float\n\nAsNamedtuple = namedtuple(\"AsNamedtuple\", \"tid amount\")\n\nclass AsSlots:\n    __slots__ = (\"tid\", \"amount\")\n    def __init__(self, tid, amount):\n        self.tid = tid\n        self.amount = amount\n\nas_dict = {\"tid\": \"t1\", \"amount\": 100.0}\nprint(\"plain dict:  \", as_dict)\nprint(\"dataclass:   \", AsDataclass(\"t1\", 100.0))\nprint(\"namedtuple:  \", AsNamedtuple(\"t1\", 100.0))\nprint(\"slots:       \", AsSlots(\"t1\", 100.0).tid)\nprint()\nprint(\"roughly, per object:  tuple < slots < dict < dataclass-with-dict\")",
+   note: 'For a handful of records the difference is irrelevant. For ten million, the choice between a tuple and a dict-backed object is gigabytes — which is when this stops being trivia.' },
+ { t: 'The columnar alternative beats all of them',
+   code: "row_wise = [{\"tid\": f\"t{i}\", \"amount\": float(i)} for i in range(5)]\n\ncol_wise = {\n    \"tid\":    [f\"t{i}\" for i in range(5)],\n    \"amount\": [float(i) for i in range(5)],\n}\n\nprint(\"row-wise: \", row_wise[:2])\nprint(\"col-wise: \", {k: v[:2] for k, v in col_wise.items()})\nprint()\nprint(\"row-wise stores the key names once PER ROW\")\nprint(\"col-wise stores them once in total — and one column can be read alone\")",
+   note: 'This is why Parquet, pandas and Spark are columnar. If per-object overhead is your problem, the answer is usually to stop having one object per row rather than to shrink the object.' }
+],
+body: [
+ { h: 'Roughly what each costs', html:
+   '<table><thead><tr><th>Representation</th><th>Per record</th><th>Trade</th></tr></thead><tbody><tr><td>tuple / namedtuple</td><td>Smallest</td><td>Immutable, positional</td></tr><tr><td><code>__slots__</code> class</td><td>Small</td><td>Fixed fields, no <code>__dict__</code></td></tr><tr><td>dict</td><td>Larger</td><td>Keys stored per row</td></tr><tr><td>Normal object</td><td>Largest</td><td>Fully flexible</td></tr><tr><td><b>Columnar arrays</b></td><td><b>Smallest by far</b></td><td>Not row-shaped</td></tr></tbody></table>' },
+ { h: 'When to reach for slots', html:
+   '<ul><li><strong>Millions of instances</strong> of the same small class.</li><li><strong>A fixed, known set of fields.</strong></li><li><strong>Nothing relies on <code>__dict__</code></strong> or on adding attributes dynamically.</li></ul><p>Outside that, slots are premature optimisation that makes the class harder to work with. Measure first — this tier’s first module exists for a reason.</p>' },
+ { h: 'The honest ordering', html:
+   '<ol><li>Do you need all these objects in memory at once? Stream instead (Tier 2).</li><li>Do you need all these columns? Project first.</li><li>Would columnar work? Use arrays, or Parquet, or leave Python.</li><li><em>Then</em> consider slots.</li></ol>' }
+],
+call: '"Every normal Python object stores attributes in a per-instance dict, which is flexible and costs memory once you have millions of them. __slots__ removes that dict, but before reaching for it I ask whether I need all the objects in memory at all — streaming or a columnar layout usually beats shrinking the object."',
+warn: '`__slots__` removes `__dict__`, which silently breaks anything that introspects the object — some serialisation libraries, debugging helpers, and code that attaches attributes dynamically. The class works until something reflective touches it.',
+qf: [
+ ["Where do a normal object's attributes live?", 'In a per-instance __dict__.'],
+ ['What does __slots__ do?', 'Replaces the instance dict with a fixed array of named fields — smaller and faster.'],
+ ['What does __slots__ cost?', 'No dynamic attributes and no __dict__, which breaks introspection.'],
+ ['What is a secondary benefit of slots?', 'A typo in an attribute name fails loudly instead of creating a new attribute.'],
+ ['Which representation is smallest per record?', 'A tuple or namedtuple — and columnar arrays beat all row-wise options.'],
+ ['What should you try before slots?', 'Streaming instead of materialising, projecting fewer columns, or a columnar layout.']
+]});
+
+M.push({
+code: 'Y5', track: 'Tier 10 · Performance and internals',
+title: 'When to leave Python',
+sub: 'The honest ceiling — and the four ways past it, in order of cost.',
+lede: 'Python is fast enough for most data engineering because most data engineering is waiting on I/O. When it genuinely is not, there is an order to the options, and reaching for the expensive one first is the mistake this module exists to prevent.',
+ex: [
+ { t: 'Where the time actually goes',
+   code: "stages = [\n    (\"read from S3\",     8.0,  \"network\"),\n    (\"decompress\",       1.2,  \"CPU, in C\"),\n    (\"parse JSON\",       4.5,  \"CPU, in Python\"),\n    (\"transform rows\",   9.0,  \"CPU, in Python\"),\n    (\"write to warehouse\", 6.0, \"network\"),\n]\n\ntotal = sum(s[1] for s in stages)\nprint(f\"{'stage':20} {'secs':>6} {'share':>7}   bound by\")\nfor name, secs, kind in stages:\n    print(f\"{name:20} {secs:>6.1f} {secs/total:>7.0%}   {kind}\")\n\nio_bound = sum(s[1] for s in stages if s[2] == \"network\")\npy_bound = sum(s[1] for s in stages if \"Python\" in s[2])\nprint()\nprint(f\"I/O: {io_bound/total:.0%}   Python CPU: {py_bound/total:.0%}\")\nprint(f\"threads help the {io_bound/total:.0%}; rewriting helps the {py_bound/total:.0%}\")",
+   note: 'Profile before choosing a strategy. Here nearly half the time is network, so concurrency wins; the other half is Python-level CPU, where concurrency does nothing and vectorising does.' },
+ { t: 'Push the work into C',
+   code: "rows = [{\"amount\": float(i)} for i in range(1000)]\n\ntotal_loop = 0.0\nops = 0\nfor r in rows:\n    total_loop += r[\"amount\"]\n    ops += 1\n\ntotal_builtin = sum(r[\"amount\"] for r in rows)\n\nprint(\"loop total:    \", total_loop, f\"({ops} Python-level iterations)\")\nprint(\"builtin total: \", total_builtin, \"(the loop runs in C)\")\nprint(\"same answer:\", total_loop == total_builtin)\nprint()\nprint(\"sum, min, max, sorted, join, any, all — all loop in C\")",
+   note: 'Built-ins do the iteration in C rather than in the interpreter. Replacing a hand-written accumulation loop with `sum` is often a few times faster for zero risk — the cheapest optimisation available.' },
+ { t: 'Vectorise: one operation over many values',
+   code: "amounts = [100.0, 250.0, 75.0, 900.0]\n\nscaled_loop = []\nfor a in amounts:\n    scaled_loop.append(a * 1.05)\n\nscaled_comp = [a * 1.05 for a in amounts]\n\nprint(\"loop:         \", scaled_loop)\nprint(\"comprehension:\", scaled_comp)\nprint()\nprint(\"in numpy this becomes ONE operation over the whole array:\")\nprint(\"  scaled = amounts * 1.05\")\nprint(\"which runs entirely in C with no per-element interpreter overhead\")",
+   note: 'A comprehension is faster than an explicit loop, and numpy is faster again because the loop disappears entirely. That is the real meaning of vectorising — not "shorter code" but "no Python-level iteration".' },
+ { t: 'The escalation ladder for CPU',
+   code: "ladder = [\n    (1, \"use built-ins and comprehensions\", \"free\",        \"2-3x\"),\n    (2, \"better algorithm or data structure\",\"free\",       \"10-1000x\"),\n    (3, \"numpy / pandas vectorisation\",     \"a rewrite\",   \"10-100x\"),\n    (4, \"push the work into SQL\",           \"design change\",\"varies\"),\n    (5, \"PyArrow / Polars / DuckDB\",        \"new dependency\",\"5-50x\"),\n    (6, \"Cython, Rust, or a C extension\",   \"real cost\",   \"10-100x\"),\n    (7, \"distribute it (Spark)\",            \"real complexity\",\"scales out\"),\n]\n\nprint(f\"{'#':>2}  {'option':34} {'cost':16} typical\")\nfor n, opt, cost, gain in ladder:\n    print(f\"{n:>2}  {opt:34} {cost:16} {gain}\")\n\nprint()\nprint(\"step 2 is where the biggest wins are, and it is free\")\nprint(\"skipping to 6 or 7 first is the answer that loses marks\")",
+   note: 'The ordering is the answer to "this job is too slow, what do you do?". Steps 1 and 2 cost nothing and solve most cases; step 7 is a different operational world and should be justified, not assumed.' }
+],
+body: [
+ { h: 'What Python is and is not good at', html:
+   '<table><thead><tr><th>Fine in Python</th><th>Leave Python</th></tr></thead><tbody><tr><td>Orchestration and glue</td><td>Tight numeric loops over millions of values</td></tr><tr><td>I/O-bound work</td><td>Per-element arithmetic at scale</td></tr><tr><td>Business logic on modest data</td><td>Anything already expressible in SQL</td></tr><tr><td>Anything the C libraries do for you</td><td>Data larger than one machine</td></tr></tbody></table>' },
+ { h: 'The strongest answer in an interview', html:
+   '<p>"Most of our time was network, so I used a thread pool and the runtime went from forty minutes to four. The CPU portion I left alone because it was 6% of the total." That is measurement, a targeted fix, and knowing when to stop — which is the whole tier in one sentence.</p>' },
+ { h: 'Do not rewrite what SQL already does', html:
+   '<p>If the transformation is a join, a filter and an aggregate, the warehouse will do it faster than any Python you write, on data that never has to move. Pulling a million rows into Python to group them is the most common self-inflicted performance problem in data engineering.</p>' }
+],
+call: '"Most pipeline time is I/O, so I profile before choosing a strategy — concurrency fixes the waiting and does nothing for Python-level CPU. When it genuinely is CPU, the order is built-ins, then a better algorithm, then vectorising, and only then a rewrite or a cluster. And if the transformation is a join and an aggregate, SQL will beat anything I write."',
+warn: 'Pulling a million rows into Python to group and aggregate them is slower than the warehouse doing it in place, and it moves all the data across the network first. The Python is not the problem — deciding to do it in Python is.',
+qf: [
+ ['What is most pipeline time spent on?', 'Waiting on I/O, not Python-level CPU.'],
+ ['What is the cheapest CPU optimisation?', 'Using built-ins and comprehensions, which loop in C.'],
+ ['What does vectorising actually mean?', 'Removing Python-level iteration — one operation over a whole array.'],
+ ['State the escalation ladder.', 'Built-ins, better algorithm, vectorise, push to SQL, Arrow/Polars/DuckDB, compiled extension, distribute.'],
+ ['Which step gives the biggest wins?', 'A better algorithm or data structure — and it is free.'],
+ ['When should the work not be in Python at all?', 'When it is a join, filter and aggregate that SQL can do without moving the data.']
+]});
+
 root.PY_MODULES = M;
 })(typeof window !== 'undefined' ? window : (typeof globalThis !== 'undefined' ? globalThis : this));
 
@@ -3419,6 +4491,10 @@ var mods = [], navBtns = [], cur = 0, doneSet = {};
    order modules were authored in; anything unlisted falls to the end. */
 var TRACK_ORDER = [
   'Tier 14 \u00b7 Interview and career',
+  'Tier 3 \u00b7 Functions',
+  'Tier 4 \u00b7 Objects',
+  'Tier 5 \u00b7 Iteration',
+  'Tier 10 \u00b7 Performance and internals',
   'Level 1 \u00b7 How Python stores data',
   'Level 2 \u00b7 Memory and volume',
   'Level 3 \u00b7 When things go wrong',
